@@ -105,10 +105,10 @@ async function readWorkspaceJsonFromBackup(
 
     const buffer = await file.async('nodebuffer');
     const content = buffer.toString('utf-8');
-    const jsonData = JSON.parse(content) as { folder?: string };
-    if (jsonData.folder) {
-      // Convert file:// URL to path
-      return jsonData.folder.replace(/^file:\/\//, '').replace(/%20/g, ' ');
+    const jsonData = JSON.parse(content) as { folder?: string; workspace?: string };
+    const uri = jsonData.folder ?? jsonData.workspace;
+    if (uri) {
+      return uri.replace(/^file:\/\//, '').replace(/%20/g, ' ');
     }
     return null;
   } catch {
@@ -182,10 +182,10 @@ export function readWorkspaceJson(workspaceDir: string): string | null {
 
   try {
     const content = readFileSync(jsonPath, 'utf-8');
-    const data = JSON.parse(content) as { folder?: string };
-    if (data.folder) {
-      // Convert file:// URL to path
-      return data.folder.replace(/^file:\/\//, '').replace(/%20/g, ' ');
+    const data = JSON.parse(content) as { folder?: string; workspace?: string };
+    const uri = data.folder ?? data.workspace;
+    if (uri) {
+      return uri.replace(/^file:\/\//, '').replace(/%20/g, ' ');
     }
     return null;
   } catch {
