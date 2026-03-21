@@ -28,3 +28,4 @@ coverage/
 *.swp
 *.txt
 *.tmp.*
+/local
