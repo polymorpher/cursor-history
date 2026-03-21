@@ -56,15 +56,19 @@ export class NoHistoryError extends CliError {
   }
 }
 
+type SessionNotFoundErrorArgs = { composerId: string } | { index: number; maxIndex: number };
+
 /**
- * Error for invalid session index
+ * Error when session is not found by index or composer ID.
  */
 export class SessionNotFoundError extends CliError {
-  constructor(index: number, maxIndex: number) {
+  constructor(args: SessionNotFoundErrorArgs) {
     const message =
-      maxIndex > 0
-        ? `Session #${index} not found. Valid range: 1-${maxIndex}`
-        : 'No sessions found.';
+      'composerId' in args
+        ? `Session not found: ${args.composerId}`
+        : args.maxIndex > 0
+          ? `Session #${args.index} not found. Valid range: 1-${args.maxIndex}`
+          : 'No sessions found.';
     super(message, ExitCode.NOT_FOUND);
     this.name = 'SessionNotFoundError';
   }

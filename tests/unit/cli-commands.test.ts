@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Command } from 'commander';
+import { SessionNotFoundError } from '../../src/lib/errors.js';
 
 // --- Mock functions ---
 const mockListSessions = vi.fn();
@@ -333,6 +334,22 @@ describe('list command', () => {
 // ==================== SHOW COMMAND ====================
 
 describe('show command', () => {
+  it('passes composer ID string to getSession when argument is not all digits', async () => {
+    const session = makeSession();
+    mockGetSession.mockResolvedValue(session);
+
+    const program = createProgram();
+    registerShowCommand(program);
+    await program.parseAsync(['node', 'test', 'show', 'uuid-abc-123-def']);
+
+    expect(mockGetSession).toHaveBeenCalledWith('uuid-abc-123-def', undefined, undefined);
+    expect(mockFormatSessionDetail).toHaveBeenCalledWith(
+      session,
+      '/ws',
+      expect.any(Object)
+    );
+  });
+
   it('shows session detail by index', async () => {
     const session = makeSession();
     mockGetSession.mockResolvedValue(session);
@@ -419,7 +436,9 @@ describe('show command', () => {
     expect(exitSpy).toHaveBeenCalled();
   });
 
-  it('exits with error for non-numeric index', async () => {
+  it('exits with error when session ID not found', async () => {
+    mockGetSession.mockRejectedValue(new SessionNotFoundError('abc'));
+
     const program = createProgram();
     registerShowCommand(program);
 
@@ -664,6 +683,33 @@ describe('export command', () => {
       'process.exit'
     );
 
+    expect(exitSpy).toHaveBeenCalledWith(3);
+  });
+
+  it('passes composer ID to getSession when export argument is not numeric', async () => {
+    const session = makeSession();
+    mockGetSession.mockResolvedValue(session);
+    mockFindWorkspaces.mockResolvedValue([{ id: 'ws1', path: '/ws' }]);
+    mockExistsSync.mockReturnValue(false);
+
+    const program = createProgram();
+    registerExportCommand(program);
+    await program.parseAsync(['node', 'test', 'export', 'my-composer-uuid', '-o', '/tmp/out.md']);
+
+    expect(mockGetSession).toHaveBeenCalledWith('my-composer-uuid', undefined, undefined);
+  });
+
+  it('exits with composer ID in error when session null and identifier is composer ID', async () => {
+    mockGetSession.mockResolvedValue(null);
+
+    const program = createProgram();
+    registerExportCommand(program);
+
+    await expect(
+      program.parseAsync(['node', 'test', 'export', 'missing-composer-id', '-o', '/tmp/out.md'])
+    ).rejects.toThrow('process.exit');
+
+    expect(consoleErrorSpy).toHaveBeenCalledWith('Session not found: missing-composer-id');
     expect(exitSpy).toHaveBeenCalledWith(3);
   });
 

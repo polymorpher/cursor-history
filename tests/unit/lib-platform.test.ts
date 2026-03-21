@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   detectPlatform,
   getDefaultCursorDataPath,
@@ -27,18 +28,20 @@ describe('detectPlatform', () => {
 describe('getDefaultCursorDataPath', () => {
   it('returns linux path', () => {
     const path = getDefaultCursorDataPath('linux');
-    expect(path).toContain('.config/Cursor/User/workspaceStorage');
+    const expected = join(homedir(), '.config', 'Cursor', 'User', 'workspaceStorage');
+    expect(path).toBe(expected);
   });
 
   it('returns macos path', () => {
     const path = getDefaultCursorDataPath('macos');
-    expect(path).toContain('Library/Application Support/Cursor');
+    const expected = join(homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'workspaceStorage');
+    expect(path).toBe(expected);
   });
 
   it('returns windows path', () => {
     const path = getDefaultCursorDataPath('windows');
-    expect(path).toContain('Cursor');
-    expect(path).toContain('workspaceStorage');
+    const expected = join(homedir(), 'AppData', 'Roaming', 'Cursor', 'User', 'workspaceStorage');
+    expect(path).toBe(expected);
   });
 });
 
@@ -66,7 +69,7 @@ describe('getCursorDataPath', () => {
 
 describe('expandPath', () => {
   it('expands ~/foo to homedir/foo', () => {
-    expect(expandPath('~/foo')).toBe(homedir() + '/foo');
+    expect(expandPath('~/foo')).toBe(join(homedir(), 'foo'));
   });
 
   it('returns absolute path unchanged', () => {
@@ -91,7 +94,7 @@ describe('contractPath', () => {
 
 describe('normalizePath', () => {
   it('expands tilde', () => {
-    expect(normalizePath('~/foo')).toBe(homedir() + '/foo');
+    expect(normalizePath('~/foo')).toBe(join(homedir(), 'foo'));
   });
 
   it('removes trailing slash', () => {

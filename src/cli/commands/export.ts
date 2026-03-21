@@ -35,7 +35,7 @@ interface ExportCommandOptions {
 export function registerExportCommand(program: Command): void {
   program
     .command('export [index]')
-    .description('Export chat session(s) to file')
+    .description('Export chat session(s) to file (index or composer ID)')
     .option('-o, --output <path>', 'Output file or directory')
     .option('-f, --format <format>', 'Output format: md or json', 'md')
     .option('--force', 'Overwrite existing files')
@@ -77,7 +77,7 @@ export function registerExportCommand(program: Command): void {
           // Validate arguments
           if (!options.all && !indexArg) {
             throw new CliError(
-              'Please specify a session index or use --all to export all sessions.',
+              'Please specify a session index or composer ID, or use --all to export all sessions.',
               ExitCode.USAGE_ERROR
             );
           }
@@ -148,10 +148,15 @@ export function registerExportCommand(program: Command): void {
               exported.push({ index: session.index, path: contractPath(filePath) });
             }
           } else {
-            // Export single session
-            const index = parseInt(indexArg!, 10);
+            // Export single session (index or composer ID)
 
-            if (isNaN(index) || index < 1) {
+            // Only treat arg as index when the entire string is digits
+            const identifier: number | string = /^\d+$/.test(indexArg!)
+              ? parseInt(indexArg!, 10)
+              : indexArg!;
+
+            // CLI uses 1-based index; 0 is invalid
+            if (typeof identifier === 'number' && identifier < 1) {
               throw new CliError(
                 `Invalid index: ${indexArg}. Must be a positive number.`,
                 ExitCode.USAGE_ERROR
@@ -159,18 +164,22 @@ export function registerExportCommand(program: Command): void {
             }
 
             const session = await getSession(
-              index,
+              identifier,
               customPath ? expandPath(customPath) : undefined,
               backupPath
             );
 
             if (!session) {
-              const sessions = await listSessions(
-                { limit: 0, all: true },
-                customPath ? expandPath(customPath) : undefined,
-                backupPath
-              );
-              throw new SessionNotFoundError(index, sessions.length);
+              if (typeof identifier === 'number') {
+                const sessions = await listSessions(
+                  { limit: 0, all: true },
+                  customPath ? expandPath(customPath) : undefined,
+                  backupPath
+                );
+                throw new SessionNotFoundError({ index: identifier, maxIndex: sessions.length });
+              } else {
+                throw new SessionNotFoundError({ composerId: identifier });
+              }
             }
 
             const workspaces = await findWorkspaces(
@@ -189,7 +198,7 @@ export function registerExportCommand(program: Command): void {
               const safeTitle = (session.title ?? 'untitled')
                 .replace(/[^a-zA-Z0-9-_]/g, '_')
                 .slice(0, 30);
-              outputPath = `${dateStr}-${index}-${safeTitle}.${format}`;
+              outputPath = `${dateStr}-${session.index}-${safeTitle}.${format}`;
             }
 
             // Check if file exists
@@ -215,7 +224,7 @@ export function registerExportCommand(program: Command): void {
                 : exportToMarkdown(session, workspacePath);
 
             writeFileSync(outputPath, content, 'utf-8');
-            exported.push({ index, path: contractPath(outputPath) });
+            exported.push({ index: session.index, path: contractPath(outputPath) });
           }
 
           // Output result

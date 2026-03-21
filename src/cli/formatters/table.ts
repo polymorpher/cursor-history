@@ -123,9 +123,13 @@ export function formatSessionsTable(sessions: ChatSessionSummary[], showIds = fa
   }
 
   lines.push('');
-  lines.push(pc.dim(`Showing ${sessions.length} session(s). Use "show <#>" to view details.`));
+  lines.push(
+    pc.dim(
+      `Showing ${sessions.length} session(s). Use "show <#>" or "show <composer-id>" to view details.`
+    )
+  );
   if (showIds) {
-    lines.push(pc.dim(`Composer IDs can be used with external tools for export.`));
+    lines.push(pc.dim(`Composer IDs can be used with external tools and show/export commands.`));
   }
 
   return lines.join('\n');
@@ -502,6 +506,9 @@ export function formatSessionDetail(
     );
   } else {
     lines.push(`${pc.bold('Messages:')} ${session.messageCount}`);
+  }
+  if (session.source === 'workspace-fallback') {
+    lines.push(pc.yellow('⚠ Partial data - loaded from workspace fallback'));
   }
   lines.push('');
   lines.push(pc.dim('─'.repeat(60)));

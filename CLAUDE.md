@@ -5,7 +5,7 @@
 CLI tool and library to browse, search, and export Cursor AI chat history. Built with TypeScript, commander, pluggable SQLite drivers (better-sqlite3 or node:sqlite), and picocolors.
 
 **Dual Interface:**
-- **CLI**: Command-line tool for interactive use (`cursor-history list`, `cursor-history show 1`)
+- **CLI**: Command-line tool for interactive use (`cursor-history list`, `cursor-history show 1` or `show <composer-id>`)
 - **Library**: Programmatic API for integration (`import { listSessions } from 'cursor-history'`)
 
 ## Quick Reference
@@ -114,10 +114,11 @@ So when someone uses `import { listSessions } from 'cursor-history'`, they're ca
 
 ### Storage Layer (`src/core/storage.ts`)
 
-- `listSessions()` - Uses workspace storage for listing (correct paths)
-- `getSession()` - Tries global storage first (full AI responses), falls back to workspace
+- `listSessions()` - Uses workspace storage for listing (correct paths); when listing all sessions (no `--workspace` filter), deduplicates by session ID and attributes to first workspace in deterministic order (.code-workspace paths before folder paths)
+- `getSession(identifier, ...)` - Get session by 1-based index (number) or composer ID (string). Tries global storage first (full AI responses), falls back to workspace. Returns null when index or composer ID not found.
 - `findWorkspaceForSession(sessionId)` - Finds which workspace contains a session by ID
-- `findWorkspaceByPath(path)` - Finds workspace by its project path
+- `findWorkspaceByPath(path)` - Finds workspace by its project path (folder or .code-workspace file path)
+- `readWorkspaceJson(workspaceDir)` - Reads workspace path from `workspace.json`: supports `folder` (single-folder workspace, file URI) and `workspace` (.code-workspace file URI); prefers `workspace` when both exist; same logic used when reading from backup zip
 - `getComposerData(db)` - Reads composer array, handles both `allComposers` and legacy formats
 - `updateComposerData(db, composers)` - Writes composer array, preserves original format
 - `resolveSessionIdentifiers(input)` - Converts index/ID/comma-separated to session ID array
@@ -235,10 +236,10 @@ Tool calls are stored in `toolFormerData`:
 | Function | Description |
 |----------|-------------|
 | `listSessions(config?)` | List sessions with pagination, returns `PaginatedResult<Session>` |
-| `getSession(index, config?)` | Get full session by zero-based index |
+| `getSession(identifier, config?)` | Get full session by zero-based index (number) or composer ID (string) |
 | `searchSessions(query, config?)` | Search across sessions, returns `SearchResult[]` |
-| `exportSessionToJson(index, config?)` | Export single session to JSON string |
-| `exportSessionToMarkdown(index, config?)` | Export single session to Markdown string |
+| `exportSessionToJson(identifier, config?)` | Export single session to JSON (index or composer ID) |
+| `exportSessionToMarkdown(identifier, config?)` | Export single session to Markdown (index or composer ID) |
 | `exportAllSessionsToJson(config?)` | Export all sessions to JSON array string |
 | `exportAllSessionsToMarkdown(config?)` | Export all sessions to Markdown string |
 | `migrateSession(config)` | Move/copy sessions to another workspace |
@@ -289,7 +290,7 @@ try {
 | Command | Description |
 |---------|-------------|
 | `list` | List sessions (--all, --ids, --workspaces, -n) |
-| `show <index>` | Show session details (-s/--short, -t/--think, -f/--fullread, -e/--error, -o/--only) |
+| `show <index>` | Show session by index or composer ID (from list --ids) (-s/--short, -t/--think, -f/--fullread, -e/--error, -o/--only) |
 | `search <query>` | Search across sessions (-n, --context) |
 | `export [index]` | Export to md/json (--all, -o, -f, --force) |
 | `migrate-session <session> <dest>` | Move/copy session(s) to workspace (--copy, --dry-run, -f, --debug) |
@@ -366,8 +367,19 @@ Edit `extractBubbleText()` in `src/core/storage.ts`. Priority matters:
 - SQLite (read-only access to existing `state.vscdb` files) (009-token-usage)
 - TypeScript 5.9+ (strict mode enabled) + commander, picocolors, better-sqlite3 / node:sqlite (existing) (010-fix-timestamp-fallback)
 - SQLite databases (`state.vscdb` files) - read-only access (010-fix-timestamp-fallback)
+- TypeScript 5.9+ (strict mode enabled) + better-sqlite3 / node:sqlite (pluggable), commander, picocolors (012-fix-session-data-integrity)
+- SQLite databases (state.vscdb files) — read-only access (012-fix-session-data-integrity)
 
 ## Recent Changes
+- 012-fix-session-data-integrity: Restored full session fidelity across storage fallbacks
+  - Added shared bubble mapping in `src/core/storage.ts` so `getSession()` and `getGlobalSession()` preserve empty bubbles as `[empty message]`, retain malformed rows as `[corrupted message]`, and populate `message.metadata.bubbleType`
+  - Populated structured `message.toolCalls` from `toolFormerData`, including default `completed` status handling and `{ _raw: ... }` sentinels for invalid params
+  - Added `session.source` to core and library types, threaded it through the library API, exposed it in CLI JSON, and surfaced a degraded warning in CLI detail output for workspace fallback sessions
+  - Replaced silent global-load fallbacks with `debugLogStorage()` messages that distinguish missing global DBs, missing `cursorDiskKV`, empty composer bubble sets, query/open failures, and malformed bubble rows
+- Workspace file path resolution: Workspaces opened via a .code-workspace file are now discovered and matchable
+  - `readWorkspaceJson()` and `readWorkspaceJsonFromBackup()` now support the `workspace` key (workspace file URI) in addition to `folder` (single-folder URI); prefer `workspace` when both exist;
+  - Listing, `--workspace` filter, and `findWorkspaceByPath()` work when the workspace path is the .code-workspace file path
+  - Session deduplication: When Cursor has two workspaceStorage entries (folder and .code-workspace), both may receive the same chats. When listing all sessions (no `--workspace` filter), the tool deduplicates by session ID so each chat appears once. Attribution is deterministic: workspaces are sorted by path with .code-workspace paths before others, so the session is attributed to the .code-workspace workspace when the same session exists in both. Deduplication is not applied when `--workspace` is used; each workspace's DB is listed as-is. Filtering or exporting by `--workspace` is unchanged (only that workspace's DB is read).
 - 010-fix-timestamp-fallback: Fixed incorrect timestamps on pre-2025-09 sessions (Issue #13)
   - Extended `RawBubbleData.timingInfo` with `clientRpcSendTime` and `clientSettleTime` fields
   - New `extractTimestamp()` function in `src/core/storage.ts`: priority chain `createdAt` > `clientRpcSendTime` > `clientSettleTime` > `clientEndTime` > `null`

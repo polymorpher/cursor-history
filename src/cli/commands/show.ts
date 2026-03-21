@@ -34,7 +34,7 @@ interface ShowCommandOptions {
 export function registerShowCommand(program: Command): void {
   program
     .command('show <index>')
-    .description('Show a chat session by index')
+    .description('Show a chat session by index or composer ID (from list --ids)')
     .option('-s, --short', 'Truncate user and assistant messages')
     .option('-t, --think', 'Show full thinking/reasoning text')
     .option('--tool', 'Show full tool call details (commands, content, results)')
@@ -50,9 +50,13 @@ export function registerShowCommand(program: Command): void {
       const customPath = options.dataPath ?? globalOptions?.dataPath;
       const backupPath = options.backup ? expandPath(options.backup) : undefined;
 
-      const index = parseInt(indexArg, 10);
+      // Only treat arg as index when the entire string is digits
+      const identifier: number | string = /^\d+$/.test(indexArg!)
+        ? parseInt(indexArg!, 10)
+        : indexArg!;
 
-      if (isNaN(index) || index < 1) {
+      // CLI uses 1-based index; 0 is invalid
+      if (typeof identifier === 'number' && identifier < 1) {
         handleError(new Error(`Invalid index: ${indexArg}. Must be a positive number.`));
       }
 
@@ -95,19 +99,22 @@ export function registerShowCommand(program: Command): void {
 
       try {
         const session = await getSession(
-          index,
+          identifier,
           customPath ? expandPath(customPath) : undefined,
           backupPath
         );
 
         if (!session) {
-          // Get max index for error message
-          const sessions = await listSessions(
-            { limit: 0, all: true },
-            customPath ? expandPath(customPath) : undefined,
-            backupPath
-          );
-          throw new SessionNotFoundError(index, sessions.length);
+          if (typeof identifier === 'number') {
+            const sessions = await listSessions(
+              { limit: 0, all: true },
+              customPath ? expandPath(customPath) : undefined,
+              backupPath
+            );
+            throw new SessionNotFoundError({ index: identifier, maxIndex: sessions.length });
+          } else {
+            throw new SessionNotFoundError({ composerId: identifier });
+          }
         }
 
         // Show backup source indicator if reading from backup

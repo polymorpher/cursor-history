@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Database } from '../../src/core/database/types.js';
 
 // Mock the database module
@@ -18,6 +18,19 @@ vi.mock('../../src/core/backup.js', () => ({
   readBackupManifest: vi.fn().mockResolvedValue(null),
 }));
 
+// For backup-from-zip tests: mock zip so readWorkspaceJsonFromBackup can read workspace.json (hoisted)
+const { mockZipLoadAsync } = vi.hoisted(() => ({
+  mockZipLoadAsync: vi.fn(),
+}));
+vi.mock('jszip', () => ({
+  default: { loadAsync: mockZipLoadAsync },
+}));
+
+vi.mock('node:fs/promises', async () => {
+  const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  return { ...actual, readFile: vi.fn().mockResolvedValue(Buffer.from('zip')) };
+});
+
 // Mock node:fs
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -30,6 +43,7 @@ vi.mock('node:fs', async () => {
 });
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readBackupManifest, openBackupDatabase } from '../../src/core/backup.js';
 import {
   readWorkspaceJson,
   findWorkspaces,
@@ -44,12 +58,14 @@ import {
   listWorkspaces,
   listGlobalSessions,
   getGlobalSession,
+  extractToolCalls,
   extractTimestamp,
   fillTimestampGaps,
   extractTokenUsage,
   extractContextWindowStatus,
   extractPromptDryRunInfo,
   extractSessionUsage,
+  mapBubbleToMessage,
 } from '../../src/core/storage.js';
 
 /**
@@ -132,6 +148,11 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
+
 // =============================================================================
 // readWorkspaceJson
 // =============================================================================
@@ -164,6 +185,53 @@ describe('readWorkspaceJson', () => {
   it('returns null when folder key is missing', () => {
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ other: 'value' }));
+    expect(readWorkspaceJson('/workspace/dir')).toBeNull();
+  });
+
+  it('returns path from workspace when folder is missing', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ workspace: 'file:///path/to/project.code-workspace' })
+    );
+    const result = readWorkspaceJson('/workspace/dir');
+    expect(result).toBe('/path/to/project.code-workspace');
+  });
+
+  it('strips file:// from workspace', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ workspace: 'file:///my/workspace.code-workspace' })
+    );
+    const result = readWorkspaceJson('/workspace/dir');
+    expect(result).toBe('/my/workspace.code-workspace');
+  });
+
+  it('decodes percent-encoded characters in workspace URI (e.g. %20, %23, %28, %29)', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({
+        workspace: 'file:///path%23with%28hash%29/my%20ws.code-workspace',
+      })
+    );
+    const result = readWorkspaceJson('/workspace/dir');
+    expect(result).toBe('/path#with(hash)/my ws.code-workspace');
+  });
+
+  it('prefers workspace when both folder and workspace exist', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({
+        folder: 'file:///folder',
+        workspace: 'file:///other.code-workspace',
+      })
+    );
+    const result = readWorkspaceJson('/workspace/dir');
+    expect(result).toBe('/other.code-workspace');
+  });
+
+  it('returns null when both folder and workspace are missing', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({}));
     expect(readWorkspaceJson('/workspace/dir')).toBeNull();
   });
 });
@@ -211,6 +279,80 @@ describe('findWorkspaces', () => {
 
     const result = await findWorkspaces('/data');
     expect(result).toEqual([]);
+  });
+
+  it('includes workspace when workspace.json has only workspace', async () => {
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const path = String(p);
+      return path.includes('state.vscdb') || path.includes('workspace.json') || path === '/data';
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ workspace: 'file:///path/to/ws.code-workspace' })
+    );
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Test' }],
+    });
+    mockOpenDatabase.mockResolvedValue(createWorkspaceDb(composerData));
+
+    const result = await findWorkspaces('/data');
+    expect(result).toHaveLength(1);
+    expect(result[0]!.path).toBe('/path/to/ws.code-workspace');
+    expect(result[0]!.sessionCount).toBe(1);
+  });
+});
+
+// =============================================================================
+// findWorkspaces (from backup) — workspace in workspace.json
+// =============================================================================
+describe('findWorkspaces (from backup)', () => {
+  it('returns path from workspace in backup zip', async () => {
+    vi.mocked(readBackupManifest).mockResolvedValueOnce({
+      version: '1.0.0',
+      createdAt: '2024-01-01T00:00:00Z',
+      cursorHistoryVersion: '0.9.2',
+      sourcePlatform: 'linux',
+      files: [
+        {
+          path: 'workspaceStorage/ws1/state.vscdb',
+          type: 'workspace-db',
+          size: 100,
+          checksum: 'sha256:abc',
+        },
+      ],
+      stats: { totalSize: 100, sessionCount: 1, workspaceCount: 1 },
+    });
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Session' }],
+    });
+    vi.mocked(openBackupDatabase).mockResolvedValueOnce(createWorkspaceDb(composerData));
+
+    mockZipLoadAsync.mockResolvedValueOnce({
+      file: (path: string) => {
+        if (path === 'workspaceStorage/ws1/workspace.json') {
+          return {
+            async: () =>
+              Promise.resolve(
+                Buffer.from(
+                  JSON.stringify({
+                    workspace: 'file:///path/to/backup-workspace.code-workspace',
+                  })
+                )
+              ),
+          };
+        }
+        return null;
+      },
+    });
+
+    const result = await findWorkspaces(undefined, '/backup.zip');
+    expect(result).toHaveLength(1);
+    expect(result[0]!.path).toBe('/path/to/backup-workspace.code-workspace');
+    expect(result[0]!.id).toBe('ws1');
   });
 });
 
@@ -282,6 +424,145 @@ describe('listSessions', () => {
     const result = await listSessions({ limit: 1, all: true }, '/data');
     expect(result).toHaveLength(3);
   });
+
+  it('deduplicates by session id when same session appears in multiple workspaces and attributes to first in sort order', async () => {
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const path = String(p);
+      return (
+        path === '/data' ||
+        path.includes('state.vscdb') ||
+        path.includes('workspace.json')
+      );
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+      { name: 'ws2', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockImplementation((path: any) => {
+      if (path.includes('ws1'))
+        return JSON.stringify({ folder: 'file:///folder' });
+      if (path.includes('ws2'))
+        return JSON.stringify({
+          workspace: 'file:///path/to/project.code-workspace',
+        });
+      return JSON.stringify({});
+    });
+
+    const sameSession = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Same chat', createdAt: 1000 }],
+    });
+    mockOpenDatabase.mockResolvedValue(createWorkspaceDb(sameSession));
+
+    const result = await listSessions({ limit: 0, all: true }, '/data');
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe('c1');
+    expect(result[0]!.workspacePath).toBe('/path/to/project.code-workspace');
+    // Index must be 1-based consecutive after dedupe (so list --ids shows 1, 2, ... N)
+    expect(result[0]!.index).toBe(1);
+  });
+
+  it('assigns consecutive 1-based indexes after dedupe so list --ids has no gaps', async () => {
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const path = String(p);
+      return (
+        path === '/data' ||
+        path.includes('state.vscdb') ||
+        path.includes('workspace.json')
+      );
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+      { name: 'ws2', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockImplementation((path: any) => {
+      if (path.includes('ws1'))
+        return JSON.stringify({ folder: 'file:///folder' });
+      if (path.includes('ws2'))
+        return JSON.stringify({
+          workspace: 'file:///path/to/project.code-workspace',
+        });
+      return JSON.stringify({});
+    });
+
+    // ws1: c1, c2, c3. ws2: c1 (dup), c4. Deduped first-occurrence order: c1, c2, c3, c4 → 4 sessions
+    mockOpenDatabase.mockImplementation((path: string) => {
+      if (path.includes('ws1'))
+        return Promise.resolve(
+          createWorkspaceDb(
+            JSON.stringify({
+              allComposers: [
+                { composerId: 'c1', name: 'A', createdAt: 1000 },
+                { composerId: 'c2', name: 'B', createdAt: 2000 },
+                { composerId: 'c3', name: 'C', createdAt: 3000 },
+              ],
+            })
+          )
+        );
+      return Promise.resolve(
+        createWorkspaceDb(
+          JSON.stringify({
+            allComposers: [
+              { composerId: 'c1', name: 'A dup', createdAt: 1000 },
+              { composerId: 'c4', name: 'D', createdAt: 4000 },
+            ],
+          })
+        )
+      );
+    });
+
+    const result = await listSessions({ limit: 0, all: true }, '/data');
+    expect(result).toHaveLength(4);
+    result.forEach((s, i) => {
+      expect(s.index).toBe(i + 1);
+    });
+  });
+
+  it('does not remove sessions when two workspaces have no overlapping session ids', async () => {
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const path = String(p);
+      return (
+        path === '/data' ||
+        path.includes('state.vscdb') ||
+        path.includes('workspace.json')
+      );
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+      { name: 'ws2', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockImplementation((path: any) => {
+      if (path.includes('ws1'))
+        return JSON.stringify({ folder: 'file:///folder' });
+      if (path.includes('ws2'))
+        return JSON.stringify({
+          workspace: 'file:///path/to/project.code-workspace',
+        });
+      return JSON.stringify({});
+    });
+
+    mockOpenDatabase.mockImplementation((path: string) => {
+      if (path.includes('ws1'))
+        return Promise.resolve(
+          createWorkspaceDb(
+            JSON.stringify({
+              allComposers: [{ composerId: 'c1', name: 'Only in folder' }],
+            })
+          )
+        );
+      return Promise.resolve(
+        createWorkspaceDb(
+          JSON.stringify({
+            allComposers: [{ composerId: 'c2', name: 'Only in workspace file' }],
+          })
+        )
+      );
+    });
+
+    const result = await listSessions({ limit: 0, all: true }, '/data');
+    expect(result).toHaveLength(2);
+    const ids = result.map((s) => s.id).sort();
+    expect(ids).toEqual(['c1', 'c2']);
+  });
 });
 
 // =============================================================================
@@ -313,6 +594,20 @@ describe('getSession', () => {
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(readdirSync).mockReturnValue([]);
     const result = await getSession(999, '/data');
+    expect(result).toBeNull();
+  });
+
+  it('returns null for unknown composer ID', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Only Session', createdAt: 1000 }],
+    });
+    mockOpenDatabase.mockResolvedValue(createWorkspaceDb(composerData));
+    const result = await getSession('unknown-composer-id', '/data');
     expect(result).toBeNull();
   });
 
@@ -356,6 +651,44 @@ describe('getSession', () => {
     expect(result!.messages[0]!.role).toBe('user');
     expect(result!.messages[0]!.content).toBe('Hello from user');
     expect(result!.messages[1]!.role).toBe('assistant');
+    expect(result!.messages[1]!.content).toBe('Here is my response');
+  });
+
+  it('returns same session when called with composer ID string', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Test Chat', createdAt: 1000 }],
+    });
+
+    const userBubble = JSON.stringify({
+      type: 1,
+      text: 'Hello from user',
+      createdAt: '2024-01-15T10:00:00Z',
+      bubbleId: 'b1',
+    });
+
+    const assistantBubble = JSON.stringify({
+      type: 2,
+      text: 'Here is my response',
+      createdAt: '2024-01-15T10:01:00Z',
+      bubbleId: 'b2',
+    });
+
+    setupGetSessionMocks(composerData, [
+      { key: 'bubbleId:c1:b1', value: userBubble },
+      { key: 'bubbleId:c1:b2', value: assistantBubble },
+    ]);
+
+    const result = await getSession('c1', '/data');
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe('c1');
+    expect(result!.messages).toHaveLength(2);
+    expect(result!.messages[0]!.content).toBe('Hello from user');
     expect(result!.messages[1]!.content).toBe('Here is my response');
   });
 
@@ -504,6 +837,102 @@ describe('getSession', () => {
     expect(result).not.toBeNull();
     expect(result!.messages[0]!.content).toContain('[Error]');
   });
+
+  it('keeps global source and preserves malformed rows as corrupted placeholders', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Test', createdAt: 1000 }],
+    });
+
+    setupGetSessionMocks(composerData, [
+      {
+        key: 'bubbleId:c1:b1',
+        value: JSON.stringify({
+          type: 2,
+          text: 'good response',
+          createdAt: '2024-01-15T10:00:00Z',
+          bubbleId: 'b1',
+        }),
+      },
+      { key: 'bubbleId:c1:b2', value: '{"type":2,' },
+    ]);
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('global');
+    expect(result!.messages).toHaveLength(2);
+    expect(result!.messages[1]!.content).toBe('[corrupted message]');
+    expect(result!.messages[1]!.metadata?.corrupted).toBe(true);
+  });
+});
+
+describe('mapBubbleToMessage', () => {
+  it('preserves empty bubbles with a placeholder and bubbleType metadata', () => {
+    const message = mapBubbleToMessage({
+      key: 'bubbleId:c1:b1',
+      value: JSON.stringify({
+        type: 2,
+        text: '',
+        createdAt: '2024-01-15T10:00:00Z',
+        bubbleId: 'b1',
+      }),
+    });
+
+    expect(message.role).toBe('assistant');
+    expect(message.content).toBe('[empty message]');
+    expect(message.metadata?.bubbleType).toBe(2);
+  });
+
+  it('returns a corrupted placeholder when the bubble row is malformed', () => {
+    const message = mapBubbleToMessage({
+      key: 'bubbleId:c1:b-bad',
+      value: '{"type":2,',
+    });
+
+    expect(message.content).toBe('[corrupted message]');
+    expect(message.role).toBe('assistant');
+    expect(message.metadata?.corrupted).toBe(true);
+  });
+});
+
+describe('extractToolCalls', () => {
+  it('preserves invalid params with a raw sentinel and defaults status to completed', () => {
+    const toolCalls = extractToolCalls({
+      toolFormerData: {
+        name: 'read_file',
+        params: '{"bad"',
+        result: '{"contents":"hello"}',
+      },
+    });
+
+    expect(toolCalls).toEqual([
+      expect.objectContaining({
+        name: 'read_file',
+        status: 'completed',
+        params: { _raw: '{"bad"' },
+      }),
+    ]);
+  });
+
+  it('prefers error status from additionalData over other values', () => {
+    const toolCalls = extractToolCalls({
+      toolFormerData: {
+        name: 'run_terminal_command',
+        status: 'completed',
+        additionalData: { status: 'error' },
+        result: '{"message":"boom"}',
+      },
+    });
+
+    expect(toolCalls?.[0]?.status).toBe('error');
+    expect(toolCalls?.[0]?.error).toContain('boom');
+  });
 });
 
 // =============================================================================
@@ -650,6 +1079,11 @@ describe('resolveSessionIdentifiers', () => {
     setupSessions();
     await expect(resolveSessionIdentifiers(999, '/data')).rejects.toThrow();
   });
+
+  it('throws for unknown composer ID string', async () => {
+    setupSessions();
+    await expect(resolveSessionIdentifiers('unknown-uuid-xyz', '/data')).rejects.toThrow();
+  });
 });
 
 // =============================================================================
@@ -674,6 +1108,29 @@ describe('findWorkspaceByPath', () => {
     const result = await findWorkspaceByPath('/nonexistent', '/data');
     expect(result).toBeNull();
   });
+
+  it('finds workspace by workspace path', async () => {
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const path = String(p);
+      return path.includes('state.vscdb') || path.includes('workspace.json') || path === '/data';
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ workspace: 'file:///path/to/ws.code-workspace' })
+    );
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Session' }],
+    });
+    mockOpenDatabase.mockResolvedValue(createWorkspaceDb(composerData));
+
+    const result = await findWorkspaceByPath('/path/to/ws.code-workspace', '/data');
+    expect(result).not.toBeNull();
+    expect(result!.workspace.path).toBe('/path/to/ws.code-workspace');
+    expect(result!.dbPath).toContain('state.vscdb');
+  });
 });
 
 // =============================================================================
@@ -695,6 +1152,85 @@ describe('getGlobalSession', () => {
     vi.mocked(existsSync).mockReturnValue(false);
     const result = await getGlobalSession(999);
     expect(result).toBeNull();
+  });
+
+  it('returns source=global and preserves malformed rows as placeholders', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const composerValue = JSON.stringify({
+      name: 'Global Session',
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T10:05:00Z',
+    });
+    const goodBubble = JSON.stringify({
+      type: 2,
+      text: 'Assistant reply',
+      createdAt: '2024-01-15T10:01:00Z',
+      bubbleId: 'b1',
+      toolFormerData: {
+        name: 'read_file',
+        params: '{"bad"',
+      },
+    });
+
+    mockOpenDatabase.mockResolvedValue({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return {
+            get: vi.fn(() => ({ name: 'cursorDiskKV' })),
+            all: vi.fn(() => []),
+            run: vi.fn(),
+          };
+        }
+        if (sql.includes("LIKE 'composerData:%'")) {
+          return {
+            get: vi.fn(),
+            all: vi.fn(() => [{ key: 'composerData:g1', value: composerValue }]),
+            run: vi.fn(),
+          };
+        }
+        if (sql.includes('COUNT(*)')) {
+          return { get: vi.fn(() => ({ count: 2 })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        if (sql.includes('LIMIT 1')) {
+          return {
+            get: vi.fn(() => ({ value: goodBubble })),
+            all: vi.fn(() => []),
+            run: vi.fn(),
+          };
+        }
+        if (sql.includes('WHERE key LIKE ? ORDER BY rowid ASC')) {
+          return {
+            get: vi.fn(),
+            all: vi.fn(() => [
+              { key: 'bubbleId:g1:b1', value: goodBubble },
+              { key: 'bubbleId:g1:b2', value: '{"type":2,' },
+            ]),
+            run: vi.fn(),
+          };
+        }
+        if (sql.includes('WHERE key = ?')) {
+          return {
+            get: vi.fn(() => ({ value: composerValue })),
+            all: vi.fn(() => []),
+            run: vi.fn(),
+          };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await getGlobalSession(1);
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('global');
+    expect(result!.messages).toHaveLength(2);
+    expect(result!.messages[0]!.metadata?.bubbleType).toBe(2);
+    expect(result!.messages[0]!.toolCalls?.[0]?.params).toEqual({ _raw: '{"bad"' });
+    expect(result!.messages[1]!.content).toBe('[corrupted message]');
+    expect(result!.messages[1]!.metadata?.corrupted).toBe(true);
   });
 });
 
@@ -1215,6 +1751,163 @@ describe('getSession (workspace fallback)', () => {
     // When global storage doesn't have the table, it falls back to workspace
     // The result depends on whether workspace data can reconstruct the session
     expect(result).toBeDefined();
+  });
+
+  it('marks fallback sessions with source=workspace-fallback and logs missing global DB', async () => {
+    vi.stubEnv('DEBUG', 'cursor-history:*');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.mocked(existsSync).mockImplementation((path) => {
+      const value = String(path);
+      if (value.includes('globalStorage/state.vscdb')) return false;
+      return value === '/data' || value.includes('state.vscdb') || value.includes('workspace.json');
+    });
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Session', createdAt: 2000 }],
+    });
+    mockOpenDatabase.mockResolvedValue(createWorkspaceDb(composerData));
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('workspace-fallback');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[cursor-history:storage] Global DB not found')
+    );
+  });
+});
+
+describe('getSession debug logging', () => {
+  function setupFallbackHarness(globalDb: Database) {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Session', createdAt: 2000 }],
+    });
+    const wsDb = createWorkspaceDb(composerData);
+
+    mockOpenDatabase.mockImplementation(async (path: string) => {
+      if (String(path).includes('globalStorage')) return globalDb;
+      return wsDb;
+    });
+  }
+
+  it('logs when cursorDiskKV is missing', async () => {
+    vi.stubEnv('DEBUG', 'cursor-history:*');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    setupFallbackHarness({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('workspace-fallback');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[cursor-history:storage] cursorDiskKV table not found')
+    );
+  });
+
+  it('logs when the composer has no global bubbles', async () => {
+    vi.stubEnv('DEBUG', 'cursor-history:*');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    setupFallbackHarness({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('workspace-fallback');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[cursor-history:storage] No bubbles for composer c1')
+    );
+  });
+
+  it('logs query errors while loading global bubbles', async () => {
+    vi.stubEnv('DEBUG', 'cursor-history:*');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    setupFallbackHarness({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        if (sql.includes('WHERE key LIKE ? ORDER BY rowid ASC')) {
+          return {
+            get: vi.fn(),
+            all: vi.fn(() => {
+              throw new Error('query failed');
+            }),
+            run: vi.fn(),
+          };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('workspace-fallback');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        '[cursor-history:storage] Failed to load global bubbles for composer c1: query failed'
+      )
+    );
+  });
+
+  it('logs malformed bubble rows while keeping the session global', async () => {
+    vi.stubEnv('DEBUG', 'cursor-history:*');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ folder: '/project' }));
+
+    const composerData = JSON.stringify({
+      allComposers: [{ composerId: 'c1', name: 'Test', createdAt: 1000 }],
+    });
+
+    setupGetSessionMocks(composerData, [{ key: 'bubbleId:c1:b1', value: '{"type":2,' }]);
+
+    const result = await getSession(1, '/data');
+
+    expect(result).not.toBeNull();
+    expect(result!.source).toBe('global');
+    expect(result!.messages[0]!.metadata?.corrupted).toBe(true);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[cursor-history:storage] Malformed bubble row bubbleId:c1:b1')
+    );
   });
 });
 
