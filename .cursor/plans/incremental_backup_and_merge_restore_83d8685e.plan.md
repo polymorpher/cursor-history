@@ -4,37 +4,37 @@ overview: Add `--since`/`--recent` date filtering to `backup` (to avoid multi-GB
 todos:
   - id: backup-types
     content: "Add `since?: Date` to `BackupConfig` in core and lib types"
-    status: pending
+    status: completed
   - id: backup-date-helpers
     content: Add `parseSinceDate()` and `parseRecentDuration()` helpers in backup CLI command
-    status: pending
+    status: completed
   - id: backup-filter-functions
     content: Add `getFilteredSessionIds()`, `createFilteredGlobalDb()`, `shouldIncludeWorkspace()` in backup.ts
-    status: pending
+    status: completed
   - id: backup-create-modify
     content: Modify `createBackup()` to use filtered path when `since` is set
-    status: pending
+    status: completed
   - id: backup-cli
     content: Add `--since` and `-r/--recent` options to backup CLI command
-    status: pending
+    status: completed
   - id: restore-types
     content: "Add `merge?: boolean` to `RestoreConfig` and `mergeStats` to `RestoreResult` in core and lib types"
-    status: pending
+    status: completed
   - id: restore-merge-functions
     content: Add `buildLocalWorkspaceMap()`, `mergeWorkspaceDb()`, and `mergeGlobalDb()` in backup.ts
-    status: pending
+    status: completed
   - id: restore-merge-flow
     content: Modify `restoreBackup()` merge mode with path-based matching (same hash, different hash, new workspace)
-    status: pending
+    status: completed
   - id: restore-cli
     content: Add `--merge` option to restore CLI command with stats display
-    status: pending
+    status: completed
   - id: update-migration-doc
     content: Update LOCAL_MIGRATION.md with simplified incremental workflow
-    status: pending
+    status: completed
   - id: tests
     content: Unit tests for date parsing, workspace merge, filtered global DB, and round-trip integration
-    status: pending
+    status: completed
 isProject: false
 ---
 
