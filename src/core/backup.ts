@@ -34,9 +34,12 @@ import type {
   BackupResult,
   RestoreConfig,
   RestoreResult,
+  MergeStats,
   BackupValidation,
   BackupInfo,
 } from './types.js';
+import { readWorkspaceJson } from './storage.js';
+import { normalizePath } from '../lib/platform.js';
 
 // Package version for manifest
 const CURSOR_HISTORY_VERSION = '0.9.2';
@@ -244,8 +247,240 @@ export function checkDiskSpace(
   }
 }
 
+// ============================================================================
+// Date-Filtered Backup Helpers
+// ============================================================================
+
+interface ComposerHead {
+  composerId?: string;
+  lastUpdatedAt?: number;
+  createdAt?: number;
+}
+
 /**
- * T012-T016: Create a full backup of all Cursor chat history
+ * Read composer heads from a workspace database (sync, requires driver pre-selected).
+ */
+function readComposerHeads(dbPath: string): ComposerHead[] {
+  try {
+    const db = registry.openSync(dbPath, { readonly: true });
+    try {
+      const row = db
+        .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+        .get() as { value: string } | undefined;
+      if (!row) return [];
+      const data = JSON.parse(row.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
+      if (Array.isArray(data)) return data;
+      return data.allComposers ?? [];
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get session IDs from all workspace DBs whose lastUpdatedAt >= since.
+ */
+function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
+  const cutoff = since.getTime();
+  const ids = new Set<string>();
+  const basePath = dataPath;
+
+  if (!existsSync(basePath)) return ids;
+
+  try {
+    const entries = readdirSync(basePath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const dbPath = join(basePath, entry.name, 'state.vscdb');
+      if (!existsSync(dbPath)) continue;
+
+      for (const head of readComposerHeads(dbPath)) {
+        if (!head.composerId) continue;
+        const ts = head.lastUpdatedAt ?? head.createdAt ?? 0;
+        if (ts >= cutoff) {
+          ids.add(head.composerId);
+        }
+      }
+    }
+  } catch {
+    // Directory not readable
+  }
+  return ids;
+}
+
+/**
+ * Check whether a workspace DB has any session updated on or after `since`.
+ */
+function shouldIncludeWorkspace(dbPath: string, since: Date): boolean {
+  const cutoff = since.getTime();
+  for (const head of readComposerHeads(dbPath)) {
+    const ts = head.lastUpdatedAt ?? head.createdAt ?? 0;
+    if (ts >= cutoff) return true;
+  }
+  return false;
+}
+
+/**
+ * Create a filtered copy of the global database containing only rows for
+ * the given session IDs. Much smaller than a full copy for incremental backups.
+ */
+async function createFilteredGlobalDb(
+  sourceDbPath: string,
+  sessionIds: Set<string>,
+  destPath: string
+): Promise<void> {
+  await registry.ensureDriver();
+  const sourceDb = registry.openSync(sourceDbPath, { readonly: true });
+  const destDb = registry.openSync(destPath, { readonly: false });
+
+  try {
+    destDb.runSQL('CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT NOT NULL, value TEXT NOT NULL)');
+    destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS cursorDiskKV_key ON cursorDiskKV(key)');
+
+    const insertStmt = destDb.prepare('INSERT OR IGNORE INTO cursorDiskKV (key, value) VALUES (?, ?)');
+    const selectComposer = sourceDb.prepare('SELECT key, value FROM cursorDiskKV WHERE key = ?');
+    const selectBubbles = sourceDb.prepare('SELECT key, value FROM cursorDiskKV WHERE key LIKE ?');
+
+    destDb.runSQL('BEGIN');
+    for (const id of sessionIds) {
+      const composer = selectComposer.get(`composerData:${id}`) as { key: string; value: string } | undefined;
+      if (composer) {
+        insertStmt.run(composer.key, composer.value);
+      }
+      const bubbles = selectBubbles.all(`bubbleId:${id}:%`) as Array<{ key: string; value: string }>;
+      for (const b of bubbles) {
+        insertStmt.run(b.key, b.value);
+      }
+    }
+    destDb.runSQL('COMMIT');
+  } finally {
+    destDb.close();
+    sourceDb.close();
+  }
+}
+
+// ============================================================================
+// Merge Restore Helpers
+// ============================================================================
+
+/**
+ * Build a map of normalizedWorkspacePath -> localHashFolder by reading
+ * workspace.json from every local workspace storage folder.
+ */
+function buildLocalWorkspaceMap(localWorkspaceStorageDir: string): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!existsSync(localWorkspaceStorageDir)) return map;
+
+  try {
+    const entries = readdirSync(localWorkspaceStorageDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const wsDir = join(localWorkspaceStorageDir, entry.name);
+      const wsPath = readWorkspaceJson(wsDir);
+      if (wsPath) {
+        map.set(normalizePath(wsPath), entry.name);
+      }
+    }
+  } catch {
+    // Not readable
+  }
+  return map;
+}
+
+/**
+ * Merge composer sessions from a backup workspace DB into a local workspace DB.
+ * Deduplicates by composerId. Returns count of new sessions added.
+ */
+function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): number {
+  const localDb = registry.openSync(localDbPath, { readonly: false });
+  let added = 0;
+
+  try {
+    const localRow = localDb
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+      .get() as { value: string } | undefined;
+
+    const backupDb = registry.openSync(backupDbPath, { readonly: true });
+    let backupRow: { value: string } | undefined;
+    try {
+      backupRow = backupDb
+        .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+        .get() as { value: string } | undefined;
+    } finally {
+      backupDb.close();
+    }
+
+    if (!backupRow) return 0;
+
+    const backupData = JSON.parse(backupRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
+    const backupComposers: ComposerHead[] = Array.isArray(backupData) ? backupData : (backupData.allComposers ?? []);
+
+    if (backupComposers.length === 0) return 0;
+
+    const localData = localRow
+      ? (JSON.parse(localRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[])
+      : { allComposers: [] };
+    const isNewFormat = !Array.isArray(localData);
+    const localComposers: ComposerHead[] = Array.isArray(localData) ? localData : (localData.allComposers ?? []);
+
+    const existingIds = new Set(localComposers.map((c) => c.composerId).filter(Boolean));
+
+    const newComposers = backupComposers.filter(
+      (c) => c.composerId && !existingIds.has(c.composerId)
+    );
+
+    if (newComposers.length === 0) return 0;
+
+    const merged = [...localComposers, ...newComposers];
+    added = newComposers.length;
+
+    let dataToWrite: unknown;
+    if (isNewFormat) {
+      dataToWrite = { ...(localData as object), allComposers: merged };
+    } else {
+      dataToWrite = merged;
+    }
+
+    const jsonValue = JSON.stringify(dataToWrite);
+    if (localRow) {
+      localDb.prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'").run(jsonValue);
+    } else {
+      localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', ?)").run(jsonValue);
+    }
+  } finally {
+    localDb.close();
+  }
+  return added;
+}
+
+/**
+ * Merge global database by inserting all backup rows that don't already exist.
+ * Returns the number of rows added.
+ */
+function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): number {
+  const db = registry.openSync(localGlobalDbPath, { readonly: false });
+  try {
+    const before = (db.prepare('SELECT COUNT(*) as c FROM cursorDiskKV').get() as { c: number }).c;
+
+    db.runSQL(`ATTACH '${backupGlobalDbPath.replace(/'/g, "''")}' AS backup`);
+    db.runSQL('INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV');
+    db.runSQL('DETACH backup');
+
+    const after = (db.prepare('SELECT COUNT(*) as c FROM cursorDiskKV').get() as { c: number }).c;
+    return after - before;
+  } finally {
+    db.close();
+  }
+}
+
+// ============================================================================
+// Backup Operations (T011-T016)
+// ============================================================================
+
+/**
+ * T012-T016: Create a backup of Cursor chat history
  */
 export async function createBackup(config?: BackupConfig): Promise<BackupResult> {
   const startTime = Date.now();
@@ -283,9 +518,9 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
   });
 
   // T008: Scan for database files
-  const dbFiles = scanDatabaseFiles(sourcePath);
+  const allDbFiles = scanDatabaseFiles(sourcePath);
 
-  if (dbFiles.length === 0) {
+  if (allDbFiles.length === 0) {
     return {
       success: false,
       backupPath: outputPath,
@@ -294,6 +529,42 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       error: `No Cursor data found at: ${sourcePath}`,
     };
   }
+
+  // Date-filtered backup: determine which session IDs and workspaces to include
+  const since = config?.since;
+  let filteredIds: Set<string> | undefined;
+  const includedWorkspaceIds = new Set<string>();
+
+  if (since) {
+    await registry.ensureDriver();
+    filteredIds = getFilteredSessionIds(sourcePath, since);
+    if (filteredIds.size === 0) {
+      return {
+        success: false,
+        backupPath: outputPath,
+        manifest: createManifest([], { totalSize: 0, sessionCount: 0, workspaceCount: 0 }),
+        durationMs: Date.now() - startTime,
+        error: `No sessions found updated since ${since.toISOString()}`,
+      };
+    }
+    // Determine which workspace DBs to include
+    for (const file of allDbFiles) {
+      if (file.type === 'workspace-db' && file.workspaceId) {
+        if (shouldIncludeWorkspace(file.absolutePath, since)) {
+          includedWorkspaceIds.add(file.workspaceId);
+        }
+      }
+    }
+  }
+
+  // Filter files if date-filtered
+  const dbFiles = since
+    ? allDbFiles.filter((f) => {
+        if (f.type === 'global-db') return true;
+        if (f.workspaceId) return includedWorkspaceIds.has(f.workspaceId);
+        return false;
+      })
+    : allDbFiles;
 
   const totalBytes = dbFiles.reduce((sum, f) => sum + f.size, 0);
 
@@ -337,7 +608,10 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       mkdirSync(dirname(tempFilePath), { recursive: true });
 
       // For SQLite databases, use backup API; for other files, just copy
-      if (dbFile.type === 'global-db' || dbFile.type === 'workspace-db') {
+      if (dbFile.type === 'global-db' && filteredIds) {
+        // Date-filtered: create partial global DB with only matching sessions
+        await createFilteredGlobalDb(dbFile.absolutePath, filteredIds, tempFilePath);
+      } else if (dbFile.type === 'global-db' || dbFile.type === 'workspace-db') {
         // T011: Backup database using SQLite backup API
         await backupDatabase(dbFile.absolutePath, tempFilePath);
       } else {
@@ -662,6 +936,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   const backupPath = config.backupPath;
   const targetPath = config.targetPath ?? getDefaultCursorDataPath();
   const force = config.force ?? false;
+  const merge = config.merge ?? false;
   const onProgress = config.onProgress;
 
   // Phase: Validating
@@ -687,12 +962,20 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   }
 
   const manifest = validation.manifest!;
-
-  // Check target directory
   const userDir = dirname(targetPath);
-  const globalDbPath = join(userDir, 'globalStorage', 'state.vscdb');
+  const localGlobalDbPath = join(userDir, 'globalStorage', 'state.vscdb');
+  const localWorkspaceStorageDir = targetPath;
 
-  if (!force && existsSync(globalDbPath)) {
+  // --merge mode: merge backup into existing data
+  if (merge) {
+    return restoreBackupMerge(
+      backupPath, targetPath, userDir, localGlobalDbPath, localWorkspaceStorageDir,
+      manifest, validation, startTime, onProgress
+    );
+  }
+
+  // Non-merge: overwrite mode (original behavior)
+  if (!force && existsSync(localGlobalDbPath)) {
     return {
       success: false,
       targetPath,
@@ -786,6 +1069,176 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
       durationMs: Date.now() - startTime,
       error: `Restore failed: ${e instanceof Error ? e.message : String(e)}`,
     };
+  }
+}
+
+/**
+ * Merge restore: import sessions from backup into existing Cursor data.
+ * Matches workspaces by path (not hash) to handle cross-machine differences.
+ */
+async function restoreBackupMerge(
+  backupPath: string,
+  targetPath: string,
+  userDir: string,
+  localGlobalDbPath: string,
+  localWorkspaceStorageDir: string,
+  manifest: BackupManifest,
+  validation: BackupValidation,
+  startTime: number,
+  onProgress?: (progress: import('./types.js').RestoreProgress) => void,
+): Promise<RestoreResult> {
+  const warnings: string[] = validation.corruptedFiles.map((f) => `Checksum mismatch: ${f}`);
+  const stats: MergeStats = {
+    sessionsAdded: 0,
+    workspacesNew: 0,
+    workspacesMerged: 0,
+    globalRowsAdded: 0,
+  };
+
+  // Extract backup to temp directory
+  const tempDir = join(userDir, `.merge_temp_${Date.now()}`);
+  mkdirSync(tempDir, { recursive: true });
+
+  try {
+    await registry.ensureDriver();
+
+    onProgress?.({
+      phase: 'extracting',
+      filesCompleted: 0,
+      totalFiles: manifest.files.length,
+      integrityStatus: validation.status === 'warnings' ? 'warnings' : 'passed',
+      corruptedFiles: validation.corruptedFiles,
+    });
+
+    // Extract all files from backup to temp
+    const zipData = await readFile(backupPath);
+    const zip = await JSZip.loadAsync(zipData);
+
+    for (let i = 0; i < manifest.files.length; i++) {
+      const fileEntry = manifest.files[i]!;
+      const file = zip.file(fileEntry.path);
+      if (!file) continue;
+
+      const buffer = await file.async('nodebuffer');
+      const platformPath = fileEntry.path.split('/').join(sep);
+      const destPath = join(tempDir, platformPath);
+      mkdirSync(dirname(destPath), { recursive: true });
+      writeFileSync(destPath, buffer);
+
+      onProgress?.({
+        phase: 'extracting',
+        currentFile: fileEntry.path,
+        filesCompleted: i + 1,
+        totalFiles: manifest.files.length,
+        integrityStatus: validation.status === 'warnings' ? 'warnings' : 'passed',
+        corruptedFiles: validation.corruptedFiles,
+      });
+    }
+
+    // Build local workspace path -> hash map
+    const localPathMap = buildLocalWorkspaceMap(localWorkspaceStorageDir);
+
+    // Process each backup workspace folder
+    const backupWsDir = join(tempDir, 'workspaceStorage');
+    if (existsSync(backupWsDir)) {
+      const entries = readdirSync(backupWsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const backupWsFolder = join(backupWsDir, entry.name);
+        const backupDbPath = join(backupWsFolder, 'state.vscdb');
+        if (!existsSync(backupDbPath)) continue;
+
+        const backupWsPath = readWorkspaceJson(backupWsFolder);
+        const normalizedBackupPath = backupWsPath ? normalizePath(backupWsPath) : null;
+
+        // Find matching local workspace by path
+        const localHash = normalizedBackupPath ? localPathMap.get(normalizedBackupPath) : undefined;
+
+        if (localHash) {
+          // Path exists locally: merge into local workspace DB
+          const localDbPath = join(localWorkspaceStorageDir, localHash, 'state.vscdb');
+          if (existsSync(localDbPath)) {
+            const added = mergeWorkspaceDb(backupDbPath, localDbPath);
+            stats.sessionsAdded += added;
+            stats.workspacesMerged++;
+          }
+        } else {
+          // Path not found locally: copy entire workspace folder
+          const destFolder = join(localWorkspaceStorageDir, entry.name);
+          if (!existsSync(destFolder)) {
+            mkdirSync(destFolder, { recursive: true });
+            // Copy all files from backup workspace folder
+            const wsFiles = readdirSync(backupWsFolder);
+            for (const wsFile of wsFiles) {
+              const src = join(backupWsFolder, wsFile);
+              const dst = join(destFolder, wsFile);
+              writeFileSync(dst, readFileSync(src));
+            }
+            // Count sessions in the newly copied workspace
+            if (existsSync(join(destFolder, 'state.vscdb'))) {
+              stats.sessionsAdded += countSessions(join(destFolder, 'state.vscdb'));
+            }
+            stats.workspacesNew++;
+          }
+        }
+      }
+    }
+
+    // Merge global database
+    const backupGlobalDbPath = join(tempDir, 'globalStorage', 'state.vscdb');
+    if (existsSync(backupGlobalDbPath) && existsSync(localGlobalDbPath)) {
+      stats.globalRowsAdded = mergeGlobalDb(backupGlobalDbPath, localGlobalDbPath);
+    } else if (existsSync(backupGlobalDbPath) && !existsSync(localGlobalDbPath)) {
+      // No local global DB yet: just copy it
+      mkdirSync(dirname(localGlobalDbPath), { recursive: true });
+      writeFileSync(localGlobalDbPath, readFileSync(backupGlobalDbPath));
+    }
+
+    onProgress?.({
+      phase: 'finalizing',
+      filesCompleted: manifest.files.length,
+      totalFiles: manifest.files.length,
+      integrityStatus: validation.status === 'warnings' ? 'warnings' : 'passed',
+    });
+
+    return {
+      success: true,
+      targetPath,
+      filesRestored: stats.workspacesNew + stats.workspacesMerged + (existsSync(join(tempDir, 'globalStorage', 'state.vscdb')) ? 1 : 0),
+      warnings,
+      durationMs: Date.now() - startTime,
+      mergeStats: stats,
+    };
+  } catch (e) {
+    return {
+      success: false,
+      targetPath,
+      filesRestored: 0,
+      warnings,
+      durationMs: Date.now() - startTime,
+      error: `Merge restore failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  } finally {
+    // Clean up temp directory
+    try {
+      const cleanupDir = (dir: string) => {
+        const entries = readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            cleanupDir(fullPath);
+          } else {
+            unlinkSync(fullPath);
+          }
+        }
+        try { rmdirSync(dir); } catch { /* ignore */ }
+      };
+      if (existsSync(tempDir)) {
+        cleanupDir(tempDir);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 }
 
