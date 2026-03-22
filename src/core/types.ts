@@ -333,6 +333,8 @@ export interface BackupConfig {
   outputPath?: string;
   /** Overwrite existing file without prompting */
   force?: boolean;
+  /** Only include sessions updated on or after this date */
+  since?: Date;
   /** Progress callback for UI updates */
   onProgress?: (progress: BackupProgress) => void;
 }
@@ -379,6 +381,8 @@ export interface RestoreConfig {
   targetPath?: string;
   /** Overwrite existing data without prompting */
   force?: boolean;
+  /** Merge backup into existing data instead of overwriting */
+  merge?: boolean;
   /** Progress callback for UI updates */
   onProgress?: (progress: RestoreProgress) => void;
 }
@@ -403,6 +407,17 @@ export interface RestoreProgress {
 /**
  * Result of a restore operation
  */
+export interface MergeStats {
+  /** Sessions added from backup */
+  sessionsAdded: number;
+  /** New workspace folders copied */
+  workspacesNew: number;
+  /** Existing workspace DBs merged */
+  workspacesMerged: number;
+  /** Rows added to global cursorDiskKV */
+  globalRowsAdded: number;
+}
+
 export interface RestoreResult {
   /** Whether restore succeeded */
   success: boolean;
@@ -416,6 +431,8 @@ export interface RestoreResult {
   durationMs: number;
   /** Error message if failed */
   error?: string;
+  /** Stats when merge mode is used */
+  mergeStats?: MergeStats;
 }
 
 /**

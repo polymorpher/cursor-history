@@ -32,6 +32,7 @@ export type {
   RestoreConfig,
   RestoreProgress,
   RestoreResult,
+  MergeStats,
   BackupValidation,
   BackupInfo,
   // SQLite driver type
