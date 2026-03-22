@@ -123,15 +123,13 @@ cursor-history restore backup.zip --merge --force   # proceed despite integrity 
 - **[src/core/types.ts](src/core/types.ts)** -- Add `merge?: boolean` to `RestoreConfig`. Extend `RestoreResult` with:
 
 ```
-  mergeStats?: { sessionsAdded, workspacesNew, workspacesMerged, globalRowsAdded }
-  
-
+  mergeStats?: { sessionsAdded, sessionsUpdated, workspacesNew, workspacesMerged, globalRowsAdded }
 ```
 
 - **[src/core/backup.ts](src/core/backup.ts)** -- New functions + modify `restoreBackup()`:
   - `buildLocalWorkspaceMap(localWorkspaceStorageDir)` -- scan all local `workspaceStorage/{hash}/workspace.json` files, return `Map<normalizedPath, localHash>`. Uses existing `readWorkspaceJson()` which handles both `folder` and `workspace` keys
-  - `mergeWorkspaceDb(backupDbPath, localDbPath)` -- read `composer.composerData` from both, merge `allComposers` arrays deduplicating by `composerId`, write back. Return count of sessions added
-  - `mergeGlobalDb(backupDbPath, localDbPath)` -- ATTACH backup DB, `INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV`. Return rows added
+  - `mergeWorkspaceDb(backupDbPath, localDbPath)` -- read `composer.composerData` from both, merge `allComposers` arrays: new sessions are added, existing sessions are **replaced if backup has a newer `lastUpdatedAt`** (handles conversations extended on the source). Returns `{ added, updated }` counts
+  - `mergeGlobalDb(backupDbPath, localDbPath)` -- ATTACH backup DB, uses **`INSERT OR REPLACE` for `composerData:*`** keys (so updated session headers with new bubble lists overwrite stale ones) and **`INSERT OR IGNORE` for `bubbleId:*`** keys (immutable bubble content, new bubbles added). Returns net rows added
   - Modify `restoreBackup()` merge path:
     1. Extract backup to temp dir
     2. Build local workspace path-to-hash map via `buildLocalWorkspaceMap()`
@@ -142,16 +140,27 @@ cursor-history restore backup.zip --merge --force   # proceed despite integrity 
     4. Call `mergeGlobalDb()` for global DB
     5. Cleanup temp dir
     6. Return result with merge stats
-- **[src/cli/commands/restore.ts](src/cli/commands/restore.ts)** -- Add `--merge` option, display merge stats, validate against bare `--force`
+- **[src/cli/commands/restore.ts](src/cli/commands/restore.ts)** -- Add `--merge` option, display merge stats (including `sessionsUpdated`), validate against bare `--force`
 - **[src/lib/types.ts](src/lib/types.ts)** -- Mirror `RestoreConfig` and `RestoreResult` changes
+
+### Merge behavior for existing sessions
+
+When a session exists on both sides (same `composerId`):
+
+1. **Workspace DB**: Compare `lastUpdatedAt` timestamps. If backup is newer, **replace** the session entry so the updated metadata (message count, title, etc.) is reflected locally.
+2. **Global DB**: `composerData:*` entries use `INSERT OR REPLACE` so the updated header (including `fullConversationHeadersOnly` with new bubble IDs) overwrites the stale one. `bubbleId:*` entries use `INSERT OR IGNORE` since bubble content is immutable — new messages from the extended conversation get inserted, existing ones are preserved.
+
+This means running `--merge` repeatedly is safe and idempotent: the newer version always wins, and no data is lost.
 
 ### Merge global DB (key logic, using ATTACH)
 
 ```typescript
-async function mergeGlobalDb(backupDbPath, localDbPath) {
+function mergeGlobalDb(backupDbPath, localDbPath) {
   // ATTACH backup DB
-  // INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV
-  // DETACH, return rows added
+  // INSERT OR REPLACE for composerData:* (session headers — newer wins)
+  // INSERT OR IGNORE for bubbleId:* (immutable message content)
+  // INSERT OR IGNORE for other keys
+  // DETACH, return net rows added
 }
 ```
 
