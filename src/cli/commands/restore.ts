@@ -13,6 +13,7 @@ import { expandPath, contractPath } from '../../lib/platform.js';
 interface RestoreCommandOptions {
   target?: string;
   force?: boolean;
+  merge?: boolean;
   json?: boolean;
   dataPath?: string;
 }
@@ -64,6 +65,7 @@ function formatRestoreResultJson(result: RestoreResult): string {
       durationMs: result.durationMs,
       ...(result.warnings.length > 0 && { warnings: result.warnings }),
       ...(result.error && { error: result.error }),
+      ...(result.mergeStats && { mergeStats: result.mergeStats }),
     },
     null,
     2
@@ -77,11 +79,22 @@ function formatRestoreResult(result: RestoreResult): string {
   const lines: string[] = [];
 
   if (result.success) {
-    lines.push(pc.green('✓ Backup restored successfully!'));
-    lines.push('');
-    lines.push(`  ${pc.bold('Target:')} ${contractPath(result.targetPath)}`);
-    lines.push(`  ${pc.bold('Files restored:')} ${result.filesRestored}`);
-    lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
+    if (result.mergeStats) {
+      lines.push(pc.green('✓ Backup merged successfully!'));
+      lines.push('');
+      lines.push(`  ${pc.bold('Target:')} ${contractPath(result.targetPath)}`);
+      lines.push(`  ${pc.bold('Sessions added:')} ${result.mergeStats.sessionsAdded}`);
+      lines.push(`  ${pc.bold('New workspaces:')} ${result.mergeStats.workspacesNew}`);
+      lines.push(`  ${pc.bold('Merged workspaces:')} ${result.mergeStats.workspacesMerged}`);
+      lines.push(`  ${pc.bold('Global rows added:')} ${result.mergeStats.globalRowsAdded}`);
+      lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
+    } else {
+      lines.push(pc.green('✓ Backup restored successfully!'));
+      lines.push('');
+      lines.push(`  ${pc.bold('Target:')} ${contractPath(result.targetPath)}`);
+      lines.push(`  ${pc.bold('Files restored:')} ${result.filesRestored}`);
+      lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
+    }
 
     if (result.warnings.length > 0) {
       lines.push('');
@@ -113,6 +126,7 @@ export function registerRestoreCommand(program: Command): void {
       'Target Cursor data path (default: platform-specific Cursor data directory)'
     )
     .option('-f, --force', 'Overwrite existing data without prompting')
+    .option('-m, --merge', 'Merge backup into existing data instead of overwriting')
     .action(async (backupArg: string, options: RestoreCommandOptions, command: Command) => {
       const globalOptions = command.parent?.opts() as { json?: boolean; dataPath?: string };
       const useJson = options.json ?? globalOptions?.json ?? false;
@@ -122,6 +136,11 @@ export function registerRestoreCommand(program: Command): void {
       const backupPath = expandPath(backupArg);
 
       try {
+        if (options.merge && options.force) {
+          console.error(pc.red('Cannot use both --merge and --force.'));
+          console.error(pc.dim('--merge imports missing sessions; --force overwrites everything.'));
+          process.exit(ExitCode.USAGE_ERROR);
+        }
         // T051: Check if backup file exists
         if (!existsSync(backupPath)) {
           if (useJson) {
@@ -177,6 +196,7 @@ export function registerRestoreCommand(program: Command): void {
           backupPath,
           targetPath,
           force: options.force ?? false,
+          merge: options.merge ?? false,
           onProgress,
         });
 
@@ -193,7 +213,7 @@ export function registerRestoreCommand(program: Command): void {
               console.log(formatRestoreResultJson(result));
             } else {
               console.error(pc.red('Target directory already has Cursor data.'));
-              console.error(pc.dim('Use --force to overwrite existing data.'));
+              console.error(pc.dim('Use --merge to import sessions, or --force to overwrite.'));
             }
             process.exit(ExitCode.IO_ERROR);
           }
