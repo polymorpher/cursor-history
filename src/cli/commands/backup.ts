@@ -12,8 +12,54 @@ import { expandPath, contractPath } from '../../lib/platform.js';
 interface BackupCommandOptions {
   output?: string;
   force?: boolean;
+  since?: string;
+  recent?: string;
   json?: boolean;
   dataPath?: string;
+}
+
+const DURATION_PATTERN = /^(\d+)([hdwm])$/;
+
+/**
+ * Parse an ISO 8601 date string (date-only or with time and optional timezone).
+ * Throws on invalid input.
+ */
+export function parseSinceDate(value: string): Date {
+  const d = new Date(value);
+  if (isNaN(d.getTime())) {
+    throw new Error(`Invalid date: "${value}". Use ISO 8601 format (e.g. 2026-03-13 or 2026-03-13T10:00:00+09:00).`);
+  }
+  return d;
+}
+
+/**
+ * Parse a relative duration string like "7d", "2w", "4h", "1m" and return
+ * the resulting cutoff Date (now minus the duration).
+ */
+export function parseRecentDuration(value: string): Date {
+  const match = value.match(DURATION_PATTERN);
+  if (!match) {
+    throw new Error(`Invalid duration: "${value}". Use format like 7d (days), 2w (weeks), 4h (hours), 1m (months).`);
+  }
+  const amount = parseInt(match[1]!, 10);
+  const unit = match[2]!;
+  const now = new Date();
+
+  switch (unit) {
+    case 'h':
+      now.setHours(now.getHours() - amount);
+      break;
+    case 'd':
+      now.setDate(now.getDate() - amount);
+      break;
+    case 'w':
+      now.setDate(now.getDate() - amount * 7);
+      break;
+    case 'm':
+      now.setMonth(now.getMonth() - amount);
+      break;
+  }
+  return now;
 }
 
 /**
@@ -108,29 +154,48 @@ function formatBackupResult(result: BackupResult): string {
 export function registerBackupCommand(program: Command): void {
   program
     .command('backup')
-    .description('Create a full backup of all Cursor chat history')
+    .description('Create a backup of Cursor chat history')
     .option(
       '-o, --output <path>',
       'Output file path (default: ~/cursor-history-backups/<timestamp>.zip)'
     )
     .option('-f, --force', 'Overwrite existing backup file')
+    .option('--since <date>', 'Only include sessions updated since this date (ISO 8601)')
+    .option('-r, --recent <duration>', 'Only include sessions from recent period (e.g. 7d, 2w, 4h, 1m)')
     .action(async (options: BackupCommandOptions, command: Command) => {
       const globalOptions = command.parent?.opts() as { json?: boolean; dataPath?: string };
       const useJson = options.json ?? globalOptions?.json ?? false;
       const customPath = options.dataPath ?? globalOptions?.dataPath;
 
       try {
+        if (options.since && options.recent) {
+          console.error(pc.red('Cannot use both --since and --recent. Pick one.'));
+          process.exit(ExitCode.USAGE_ERROR);
+        }
+
+        let since: Date | undefined;
+        if (options.since) {
+          since = parseSinceDate(options.since);
+        } else if (options.recent) {
+          since = parseRecentDuration(options.recent);
+        }
+
         // Resolve output path if provided
         const outputPath = options.output ? expandPath(options.output) : undefined;
 
         // Show progress if not JSON mode
         const onProgress = useJson ? undefined : displayProgress;
 
+        if (since && !useJson) {
+          console.log(pc.dim(`Filtering sessions updated since ${since.toISOString()}\n`));
+        }
+
         // Create backup
         const result = await createBackup({
           sourcePath: customPath ? expandPath(customPath) : undefined,
           outputPath,
           force: options.force ?? false,
+          since,
           onProgress,
         });
 
