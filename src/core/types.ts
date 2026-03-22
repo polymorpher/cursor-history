@@ -410,11 +410,13 @@ export interface RestoreProgress {
 export interface MergeStats {
   /** Sessions added from backup */
   sessionsAdded: number;
+  /** Existing sessions updated (backup was newer) */
+  sessionsUpdated: number;
   /** New workspace folders copied */
   workspacesNew: number;
   /** Existing workspace DBs merged */
   workspacesMerged: number;
-  /** Rows added to global cursorDiskKV */
+  /** Rows added or updated in global cursorDiskKV */
   globalRowsAdded: number;
 }
 

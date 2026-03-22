@@ -391,11 +391,13 @@ function buildLocalWorkspaceMap(localWorkspaceStorageDir: string): Map<string, s
 
 /**
  * Merge composer sessions from a backup workspace DB into a local workspace DB.
- * Deduplicates by composerId. Returns count of new sessions added.
+ * New sessions are added; existing sessions are replaced if the backup version
+ * has a newer lastUpdatedAt (handles conversations extended on the source machine).
  */
-function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): number {
+function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): { added: number; updated: number } {
   const localDb = registry.openSync(localDbPath, { readonly: false });
   let added = 0;
+  let updated = 0;
 
   try {
     const localRow = localDb
@@ -412,12 +414,12 @@ function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): number {
       backupDb.close();
     }
 
-    if (!backupRow) return 0;
+    if (!backupRow) return { added: 0, updated: 0 };
 
     const backupData = JSON.parse(backupRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
     const backupComposers: ComposerHead[] = Array.isArray(backupData) ? backupData : (backupData.allComposers ?? []);
 
-    if (backupComposers.length === 0) return 0;
+    if (backupComposers.length === 0) return { added: 0, updated: 0 };
 
     const localData = localRow
       ? (JSON.parse(localRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[])
@@ -425,16 +427,31 @@ function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): number {
     const isNewFormat = !Array.isArray(localData);
     const localComposers: ComposerHead[] = Array.isArray(localData) ? localData : (localData.allComposers ?? []);
 
-    const existingIds = new Set(localComposers.map((c) => c.composerId).filter(Boolean));
+    const localById = new Map<string, ComposerHead>();
+    for (const c of localComposers) {
+      if (c.composerId) localById.set(c.composerId, c);
+    }
 
-    const newComposers = backupComposers.filter(
-      (c) => c.composerId && !existingIds.has(c.composerId)
-    );
+    const merged: ComposerHead[] = [...localComposers];
 
-    if (newComposers.length === 0) return 0;
+    for (const bc of backupComposers) {
+      if (!bc.composerId) continue;
+      const existing = localById.get(bc.composerId);
+      if (!existing) {
+        merged.push(bc);
+        added++;
+      } else {
+        const backupTs = bc.lastUpdatedAt ?? bc.createdAt ?? 0;
+        const localTs = existing.lastUpdatedAt ?? existing.createdAt ?? 0;
+        if (backupTs > localTs) {
+          const idx = merged.indexOf(existing);
+          if (idx !== -1) merged[idx] = bc;
+          updated++;
+        }
+      }
+    }
 
-    const merged = [...localComposers, ...newComposers];
-    added = newComposers.length;
+    if (added === 0 && updated === 0) return { added: 0, updated: 0 };
 
     let dataToWrite: unknown;
     if (isNewFormat) {
@@ -452,12 +469,18 @@ function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): number {
   } finally {
     localDb.close();
   }
-  return added;
+  return { added, updated };
 }
 
 /**
- * Merge global database by inserting all backup rows that don't already exist.
- * Returns the number of rows added.
+ * Merge global database entries from backup into local.
+ *
+ * - composerData:* entries use INSERT OR REPLACE so that updated session
+ *   headers (e.g. extended conversations with new bubble IDs) overwrite stale ones.
+ * - bubbleId:* entries use INSERT OR IGNORE since bubble content is immutable;
+ *   new bubbles from extended conversations get added, existing ones are kept.
+ *
+ * Returns the net number of rows added.
  */
 function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): number {
   const db = registry.openSync(localGlobalDbPath, { readonly: false });
@@ -465,7 +488,12 @@ function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): n
     const before = (db.prepare('SELECT COUNT(*) as c FROM cursorDiskKV').get() as { c: number }).c;
 
     db.runSQL(`ATTACH '${backupGlobalDbPath.replace(/'/g, "''")}' AS backup`);
-    db.runSQL('INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV');
+    // Session headers: replace if backup is newer (updated bubble list, metadata)
+    db.runSQL("INSERT OR REPLACE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key LIKE 'composerData:%'");
+    // Bubble data: only add new (immutable content, unique keys)
+    db.runSQL("INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key LIKE 'bubbleId:%'");
+    // Any other keys: add if missing
+    db.runSQL("INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key NOT LIKE 'composerData:%' AND key NOT LIKE 'bubbleId:%'");
     db.runSQL('DETACH backup');
 
     const after = (db.prepare('SELECT COUNT(*) as c FROM cursorDiskKV').get() as { c: number }).c;
@@ -1090,6 +1118,7 @@ async function restoreBackupMerge(
   const warnings: string[] = validation.corruptedFiles.map((f) => `Checksum mismatch: ${f}`);
   const stats: MergeStats = {
     sessionsAdded: 0,
+    sessionsUpdated: 0,
     workspacesNew: 0,
     workspacesMerged: 0,
     globalRowsAdded: 0,
@@ -1158,8 +1187,9 @@ async function restoreBackupMerge(
           // Path exists locally: merge into local workspace DB
           const localDbPath = join(localWorkspaceStorageDir, localHash, 'state.vscdb');
           if (existsSync(localDbPath)) {
-            const added = mergeWorkspaceDb(backupDbPath, localDbPath);
-            stats.sessionsAdded += added;
+            const result = mergeWorkspaceDb(backupDbPath, localDbPath);
+            stats.sessionsAdded += result.added;
+            stats.sessionsUpdated += result.updated;
             stats.workspacesMerged++;
           }
         } else {

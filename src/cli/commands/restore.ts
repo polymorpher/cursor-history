@@ -84,6 +84,7 @@ function formatRestoreResult(result: RestoreResult): string {
       lines.push('');
       lines.push(`  ${pc.bold('Target:')} ${contractPath(result.targetPath)}`);
       lines.push(`  ${pc.bold('Sessions added:')} ${result.mergeStats.sessionsAdded}`);
+      lines.push(`  ${pc.bold('Sessions updated:')} ${result.mergeStats.sessionsUpdated}`);
       lines.push(`  ${pc.bold('New workspaces:')} ${result.mergeStats.workspacesNew}`);
       lines.push(`  ${pc.bold('Merged workspaces:')} ${result.mergeStats.workspacesMerged}`);
       lines.push(`  ${pc.bold('Global rows added:')} ${result.mergeStats.globalRowsAdded}`);
