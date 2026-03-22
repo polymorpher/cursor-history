@@ -32,8 +32,10 @@ vi.mock('../../src/core/database/registry.js', () => ({
   registry: {
     openSync: vi.fn(() => ({
       prepare: vi.fn(() => ({ get: vi.fn(), all: vi.fn(() => []), run: vi.fn() })),
+      runSQL: vi.fn(),
       close: vi.fn(),
     })),
+    ensureDriver: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -41,6 +43,16 @@ vi.mock('../../src/core/database/registry.js', () => ({
 vi.mock('../../src/core/database/index.js', () => ({
   backupDatabase: vi.fn().mockResolvedValue(undefined),
   ensureDriver: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Mock storage (readWorkspaceJson used by merge helpers)
+vi.mock('../../src/core/storage.js', () => ({
+  readWorkspaceJson: vi.fn(() => null),
+}));
+
+// Mock platform (normalizePath used by merge helpers)
+vi.mock('../../src/lib/platform.js', () => ({
+  normalizePath: vi.fn((p: string) => p),
 }));
 
 // Mock jszip - vi.hoisted ensures variables are available in hoisted vi.mock
@@ -446,6 +458,40 @@ describe('restoreBackup', () => {
     });
 
     const result = await restoreBackup({ backupPath: '/backup.zip', force: false });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('already has Cursor data');
+  });
+
+  it('returns failure when target has existing data and hints --merge', async () => {
+    const fileContent = Buffer.from('database content');
+    const checksum = computeChecksum(fileContent);
+    const manifest = {
+      version: '1.0.0',
+      files: [
+        {
+          path: 'globalStorage/state.vscdb',
+          size: fileContent.length,
+          checksum,
+          type: 'global-db',
+        },
+      ],
+    };
+
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFile).mockResolvedValue(Buffer.from('zipdata'));
+    mockZipLoadAsync.mockResolvedValue({
+      file: vi.fn((name: string) => {
+        if (name === 'manifest.json') {
+          return { async: vi.fn().mockResolvedValue(Buffer.from(JSON.stringify(manifest))) };
+        }
+        if (name === 'globalStorage/state.vscdb') {
+          return { async: vi.fn().mockResolvedValue(fileContent) };
+        }
+        return null;
+      }),
+    });
+
+    const result = await restoreBackup({ backupPath: '/backup.zip' });
     expect(result.success).toBe(false);
     expect(result.error).toContain('already has Cursor data');
   });
