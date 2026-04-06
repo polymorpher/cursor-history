@@ -492,27 +492,37 @@ export async function findWorkspaces(
       const workspacePath = readWorkspaceJson(workspaceDir);
       if (!workspacePath) continue;
 
-      // Count sessions in this workspace
       let sessionCount = 0;
+      let migrated = false;
       try {
         const db = await openDatabase(dbPath);
         const result = getChatDataFromDb(db);
         if (result) {
           const parsed = parseChatData(result.data, result.bundle);
           sessionCount = parsed.length;
+          if (sessionCount === 0) {
+            try {
+              const raw = JSON.parse(result.data) as { hasMigratedComposerData?: boolean };
+              if (raw?.hasMigratedComposerData) {
+                migrated = true;
+              }
+            } catch {
+              // Ignore parse errors
+            }
+          }
         }
         db.close();
       } catch {
-        // Skip workspaces with unreadable databases
         continue;
       }
 
-      if (sessionCount > 0) {
+      if (sessionCount > 0 || migrated) {
         workspaces.push({
           id: entry.name,
           path: workspacePath,
           dbPath,
           sessionCount,
+          migrated,
         });
       }
     }
@@ -614,12 +624,17 @@ export async function listSessions(
   });
 
   const allSessions: ChatSessionSummary[] = [];
-  // When listing all workspaces (no filter), dedupe by session id; keep first occurrence (workspace order is already deterministic)
-  const seenIds = options.workspacePath ? null : new Set<string>();
+  const seenIds = new Set<string>();
 
+  // Build workspace-hash -> human-readable-path map for global session resolution
+  const workspacePathMap = new Map<string, string>();
+  for (const w of workspaces) {
+    workspacePathMap.set(w.id, w.path);
+  }
+
+  // Phase 1: collect sessions from workspace DBs (may be stale/empty post-migration)
   for (const workspace of filteredWorkspaces) {
     try {
-      // Open database from live or backup source
       const db = backupPath
         ? await openBackupDatabase(backupPath, workspace.dbPath)
         : await openDatabase(workspace.dbPath);
@@ -631,11 +646,11 @@ export async function listSessions(
       const sessions = parseChatData(result.data, result.bundle);
 
       for (const session of sessions) {
-        if (seenIds?.has(session.id)) continue;
-        seenIds?.add(session.id);
+        if (seenIds.has(session.id)) continue;
+        seenIds.add(session.id);
         allSessions.push({
           id: session.id,
-          index: 0, // Will be assigned after sorting
+          index: 0,
           title: session.title,
           createdAt: session.createdAt,
           lastUpdatedAt: session.lastUpdatedAt,
@@ -648,6 +663,24 @@ export async function listSessions(
     } catch {
       continue;
     }
+  }
+
+  // Phase 2: merge sessions from global cursorDiskKV (catches migrated/new sessions)
+  try {
+    const globalSessions = await listGlobalSessions(customDataPath, backupPath, workspacePathMap);
+
+    const matchingWsIds = options.workspacePath
+      ? new Set(filteredWorkspaces.map((w) => w.id))
+      : null;
+
+    for (const gs of globalSessions) {
+      if (seenIds.has(gs.id)) continue;
+      if (matchingWsIds && !matchingWsIds.has(gs.workspaceId)) continue;
+      seenIds.add(gs.id);
+      allSessions.push(gs);
+    }
+  } catch {
+    // Global merge is best-effort; workspace-only listing still works
   }
 
   // Sort by most recent first
@@ -894,18 +927,95 @@ export async function searchSessions(
  * List sessions from global Cursor storage (cursorDiskKV table)
  * This is where Cursor stores full conversation data including AI responses
  */
-export async function listGlobalSessions(): Promise<ChatSessionSummary[]> {
-  const globalPath = getGlobalStoragePath();
-  const dbPath = join(globalPath, 'state.vscdb');
+/**
+ * Shape of workspaceIdentifier stored on global composerData rows.
+ * Cursor uses `configPath` for .code-workspace files and `uri` for plain folders.
+ */
+interface GlobalWorkspaceIdentifier {
+  id?: string;
+  configPath?: { fsPath?: string };
+  uri?: { fsPath?: string };
+}
 
-  if (!existsSync(dbPath)) {
-    return [];
+interface GlobalComposerRow {
+  name?: string;
+  title?: string;
+  createdAt?: number | string;
+  lastUpdatedAt?: number | string;
+  workspaceIdentifier?: GlobalWorkspaceIdentifier;
+  /** Legacy field, kept for backward compat with older global entries */
+  workspaceUri?: string;
+}
+
+function resolveGlobalWorkspacePath(
+  data: GlobalComposerRow,
+  workspacePathMap?: Map<string, string>
+): { workspacePath: string; workspaceId: string } {
+  const wsId = data.workspaceIdentifier;
+
+  if (wsId?.id) {
+    const mapped = workspacePathMap?.get(wsId.id);
+    if (mapped) {
+      return { workspacePath: mapped, workspaceId: wsId.id };
+    }
+
+    const fsPath = wsId.configPath?.fsPath ?? wsId.uri?.fsPath;
+    if (fsPath) {
+      return { workspacePath: fsPath, workspaceId: wsId.id };
+    }
+
+    return { workspacePath: 'Global', workspaceId: wsId.id };
   }
 
-  try {
-    const db = await openDatabase(dbPath);
+  if (data.workspaceUri) {
+    const decoded = decodeURIComponent(
+      data.workspaceUri.replace(/^file:\/\//, '')
+    );
+    return { workspacePath: decoded, workspaceId: 'global' };
+  }
 
-    // Check if cursorDiskKV table exists
+  return { workspacePath: 'Global', workspaceId: 'global' };
+}
+
+function toDate(value: number | string | undefined, fallback: Date): Date {
+  if (typeof value === 'number' && value > 1_000_000_000_000) {
+    return new Date(value);
+  }
+  if (typeof value === 'string') {
+    const d = new Date(value);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return fallback;
+}
+
+export async function listGlobalSessions(
+  customDataPath?: string,
+  backupPath?: string,
+  workspacePathMap?: Map<string, string>
+): Promise<ChatSessionSummary[]> {
+  // Derive globalStorage path: customDataPath points at workspaceStorage,
+  // so its sibling directory is globalStorage.
+  const globalPath = customDataPath
+    ? join(customDataPath, '..', 'globalStorage')
+    : getGlobalStoragePath();
+  const globalDbPath = join(globalPath, 'state.vscdb');
+
+  let db: Database | null = null;
+  try {
+    if (backupPath) {
+      try {
+        db = await openBackupDatabase(backupPath, 'globalStorage/state.vscdb');
+      } catch {
+        return [];
+      }
+    } else if (!existsSync(globalDbPath)) {
+      return [];
+    } else {
+      db = await openDatabase(globalDbPath);
+    }
+
+    if (!db) return [];
+
     const tableCheck = db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'")
       .get();
@@ -915,10 +1025,21 @@ export async function listGlobalSessions(): Promise<ChatSessionSummary[]> {
       return [];
     }
 
-    // Get all composerData entries
     const composerRows = db
       .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
       .all() as { key: string; value: string }[];
+
+    // Single pass: collect all composerIds that have at least one bubble.
+    const bubbleCounts = new Map<string, number>();
+    const countRows = db
+      .prepare(
+        "SELECT SUBSTR(key, 10, INSTR(SUBSTR(key, 10), ':') - 1) AS cid, COUNT(*) AS cnt " +
+        "FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' GROUP BY cid"
+      )
+      .all() as { cid: string; cnt: number }[];
+    for (const cr of countRows) {
+      bubbleCounts.set(cr.cid, cr.cnt);
+    }
 
     const sessions: ChatSessionSummary[] = [];
 
@@ -926,51 +1047,38 @@ export async function listGlobalSessions(): Promise<ChatSessionSummary[]> {
       const composerId = row.key.replace('composerData:', '');
 
       try {
-        const data = JSON.parse(row.value) as {
-          name?: string;
-          title?: string;
-          createdAt?: string;
-          updatedAt?: string;
-          workspaceUri?: string;
-        };
+        const data = JSON.parse(row.value) as
+          | (GlobalComposerRow & {
+              fullConversationHeadersOnly?: Array<{ bubbleId?: string; type?: number }>;
+            })
+          | null;
+        if (!data) continue;
 
-        // Count bubbles for this composer
-        const bubbleCount = db
-          .prepare('SELECT COUNT(*) as count FROM cursorDiskKV WHERE key LIKE ?')
-          .get(`bubbleId:${composerId}:%`) as { count: number };
+        const msgCount =
+          bubbleCounts.get(composerId) ??
+          data.fullConversationHeadersOnly?.length ??
+          0;
+        if (msgCount === 0) continue;
 
-        if (bubbleCount.count === 0) continue;
+        const preview = data.name ?? data.title ?? '(Untitled session)';
 
-        // Get first bubble for preview
-        const firstBubble = db
-          .prepare('SELECT value FROM cursorDiskKV WHERE key LIKE ? ORDER BY rowid ASC LIMIT 1')
-          .get(`bubbleId:${composerId}:%`) as { value: string } | undefined;
-
-        let preview = '';
-        if (firstBubble) {
-          try {
-            const bubbleData = JSON.parse(firstBubble.value);
-            preview = extractBubbleText(bubbleData).slice(0, 100);
-          } catch {
-            // Ignore
-          }
-        }
-
-        const createdAt = data.createdAt ? new Date(data.createdAt) : new Date();
-        const workspacePath = data.workspaceUri
-          ? data.workspaceUri.replace(/^file:\/\//, '').replace(/%20/g, ' ')
-          : 'Global';
+        const createdAt = toDate(data.createdAt, new Date());
+        const lastUpdatedAt = toDate(data.lastUpdatedAt, createdAt);
+        const { workspacePath, workspaceId } = resolveGlobalWorkspacePath(
+          data,
+          workspacePathMap
+        );
 
         sessions.push({
           id: composerId,
           index: 0,
           title: data.name ?? data.title ?? null,
           createdAt,
-          lastUpdatedAt: data.updatedAt ? new Date(data.updatedAt) : createdAt,
-          messageCount: bubbleCount.count,
-          workspaceId: 'global',
+          lastUpdatedAt,
+          messageCount: msgCount,
+          workspaceId,
           workspacePath: contractPath(workspacePath),
-          preview,
+          preview: preview.slice(0, 100),
         });
       } catch {
         continue;
@@ -979,16 +1087,15 @@ export async function listGlobalSessions(): Promise<ChatSessionSummary[]> {
 
     db.close();
 
-    // Sort by most recent first
     sessions.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
-    // Assign indexes
     sessions.forEach((session, i) => {
       session.index = i + 1;
     });
 
     return sessions;
   } catch {
+    if (db) closeDatabase(db);
     return [];
   }
 }
@@ -1851,6 +1958,7 @@ export async function findWorkspaceForSession(
 ): Promise<{ workspace: Workspace; dbPath: string } | null> {
   const workspaces = await findWorkspaces(customDataPath);
 
+  // Phase 1: search workspace-local composer arrays
   for (const workspace of workspaces) {
     try {
       const db = await openDatabase(workspace.dbPath);
@@ -1859,12 +1967,10 @@ export async function findWorkspaceForSession(
 
       if (!result) continue;
 
-      // Parse the composerData - could be new format with allComposers or legacy format
       const parsed = JSON.parse(result.data) as
-        | { allComposers?: Array<{ composerId?: string }> }
+        | { allComposers?: Array<{ composerId?: string }>; hasMigratedComposerData?: boolean }
         | Array<{ composerId?: string }>;
 
-      // Handle new format with allComposers array
       let composers: Array<{ composerId?: string }>;
       if ('allComposers' in parsed && Array.isArray(parsed.allComposers)) {
         composers = parsed.allComposers;
@@ -1882,6 +1988,36 @@ export async function findWorkspaceForSession(
     } catch {
       continue;
     }
+  }
+
+  // Phase 2: check global composerData for workspaceIdentifier
+  try {
+    const globalPath = getGlobalStoragePath();
+    const globalDbPath = join(globalPath, 'state.vscdb');
+
+    if (existsSync(globalDbPath)) {
+      const db = await openDatabase(globalDbPath);
+      try {
+        const row = db
+          .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+          .get(`composerData:${sessionId}`) as { value: string } | undefined;
+
+        if (row) {
+          const data = JSON.parse(row.value) as GlobalComposerRow | null;
+          const wsHash = data?.workspaceIdentifier?.id;
+          if (wsHash) {
+            const match = workspaces.find((w) => w.id === wsHash);
+            if (match) {
+              return { workspace: match, dbPath: match.dbPath };
+            }
+          }
+        }
+      } finally {
+        db.close();
+      }
+    }
+  } catch {
+    // Best-effort fallback
   }
 
   return null;
