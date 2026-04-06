@@ -1142,6 +1142,112 @@ describe('listGlobalSessions', () => {
     const result = await listGlobalSessions();
     expect(result).toEqual([]);
   });
+
+  it('parses numeric timestamps and workspaceIdentifier with uri', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const composerValue = JSON.stringify({
+      name: 'Recent Chat',
+      createdAt: 1775340000000,
+      lastUpdatedAt: 1775341000000,
+      workspaceIdentifier: {
+        id: 'ws-hash-123',
+        uri: { fsPath: '/Users/dev/myproject' },
+      },
+    });
+
+    mockOpenDatabase.mockResolvedValue({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        if (sql.includes("LIKE 'composerData:%'")) {
+          return { get: vi.fn(), all: vi.fn(() => [{ key: 'composerData:c1', value: composerValue }]), run: vi.fn() };
+        }
+        if (sql.includes('GROUP BY')) {
+          return { get: vi.fn(), all: vi.fn(() => [{ cid: 'c1', cnt: 5 }]), run: vi.fn() };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await listGlobalSessions();
+    expect(result).toHaveLength(1);
+    expect(result[0]!.title).toBe('Recent Chat');
+    expect(result[0]!.messageCount).toBe(5);
+    expect(result[0]!.workspaceId).toBe('ws-hash-123');
+    expect(result[0]!.workspacePath).toContain('myproject');
+    expect(result[0]!.createdAt.getTime()).toBe(1775340000000);
+    expect(result[0]!.lastUpdatedAt.getTime()).toBe(1775341000000);
+  });
+
+  it('uses workspacePathMap to resolve workspace hash', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const composerValue = JSON.stringify({
+      name: 'Mapped Chat',
+      createdAt: 1775340000000,
+      workspaceIdentifier: { id: 'abc123' },
+    });
+
+    mockOpenDatabase.mockResolvedValue({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        if (sql.includes("LIKE 'composerData:%'")) {
+          return { get: vi.fn(), all: vi.fn(() => [{ key: 'composerData:c3', value: composerValue }]), run: vi.fn() };
+        }
+        if (sql.includes('GROUP BY')) {
+          return { get: vi.fn(), all: vi.fn(() => [{ cid: 'c3', cnt: 1 }]), run: vi.fn() };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const pathMap = new Map([['abc123', '/Users/dev/my-project']]);
+    const result = await listGlobalSessions(undefined, undefined, pathMap);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.workspacePath).toContain('my-project');
+  });
+
+  it('falls back to fullConversationHeadersOnly length when no bubble rows', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const composerValue = JSON.stringify({
+      name: 'Headers-only Chat',
+      createdAt: 1775340000000,
+      fullConversationHeadersOnly: [
+        { bubbleId: 'b1', type: 1 },
+        { bubbleId: 'b2', type: 2 },
+      ],
+    });
+
+    mockOpenDatabase.mockResolvedValue({
+      prepare: vi.fn((sql: string) => {
+        if (sql.includes('sqlite_master')) {
+          return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+        }
+        if (sql.includes("LIKE 'composerData:%'")) {
+          return { get: vi.fn(), all: vi.fn(() => [{ key: 'composerData:c4', value: composerValue }]), run: vi.fn() };
+        }
+        if (sql.includes('GROUP BY')) {
+          return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+        }
+        return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+      }),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const result = await listGlobalSessions();
+    expect(result).toHaveLength(1);
+    expect(result[0]!.messageCount).toBe(2);
+  });
 });
 
 // =============================================================================
@@ -1159,8 +1265,8 @@ describe('getGlobalSession', () => {
 
     const composerValue = JSON.stringify({
       name: 'Global Session',
-      createdAt: '2024-01-15T10:00:00Z',
-      updatedAt: '2024-01-15T10:05:00Z',
+      createdAt: 1705312800000,
+      lastUpdatedAt: 1705313100000,
     });
     const goodBubble = JSON.stringify({
       type: 2,
@@ -1189,15 +1295,8 @@ describe('getGlobalSession', () => {
             run: vi.fn(),
           };
         }
-        if (sql.includes('COUNT(*)')) {
-          return { get: vi.fn(() => ({ count: 2 })), all: vi.fn(() => []), run: vi.fn() };
-        }
-        if (sql.includes('LIMIT 1')) {
-          return {
-            get: vi.fn(() => ({ value: goodBubble })),
-            all: vi.fn(() => []),
-            run: vi.fn(),
-          };
+        if (sql.includes('GROUP BY')) {
+          return { get: vi.fn(), all: vi.fn(() => [{ cid: 'g1', cnt: 2 }]), run: vi.fn() };
         }
         if (sql.includes('WHERE key LIKE ? ORDER BY rowid ASC')) {
           return {
@@ -1340,9 +1439,8 @@ describe('listGlobalSessions (with data)', () => {
 
     const composerValue = JSON.stringify({
       name: 'Global Session',
-      createdAt: '2024-01-15T10:00:00Z',
+      createdAt: 1705312800000,
     });
-    const bubbleValue = JSON.stringify({ type: 1, text: 'Hello from global' });
 
     mockOpenDatabase.mockResolvedValue({
       prepare: vi.fn((sql: string) => {
@@ -1360,11 +1458,8 @@ describe('listGlobalSessions (with data)', () => {
             run: vi.fn(),
           };
         }
-        if (sql.includes('COUNT(*)')) {
-          return { get: vi.fn(() => ({ count: 2 })), all: vi.fn(() => []), run: vi.fn() };
-        }
-        if (sql.includes('LIMIT 1')) {
-          return { get: vi.fn(() => ({ value: bubbleValue })), all: vi.fn(() => []), run: vi.fn() };
+        if (sql.includes('GROUP BY')) {
+          return { get: vi.fn(), all: vi.fn(() => [{ cid: 'g1', cnt: 2 }]), run: vi.fn() };
         }
         return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
       }),
@@ -2699,5 +2794,189 @@ describe('extractSessionUsage', () => {
   it('returns partial composer data when only some fields present', () => {
     const result = extractSessionUsage({ contextTokensUsed: 5000 } as never, []);
     expect(result).toEqual({ contextTokensUsed: 5000 });
+  });
+});
+
+// =============================================================================
+// Global storage migration scenarios
+// =============================================================================
+describe('findWorkspaces (migrated workspaces)', () => {
+  it('includes workspaces with hasMigratedComposerData even if 0 local sessions', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws-migrated', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ folder: 'file:///Users/dev/my-project' })
+    );
+
+    const migratedData = JSON.stringify({
+      hasMigratedComposerData: true,
+      selectedComposerIds: ['abc'],
+      lastFocusedComposerIds: ['abc'],
+    });
+
+    mockOpenDatabase.mockResolvedValue({
+      prepare: vi.fn(() => ({
+        get: vi.fn((key?: string) => {
+          if (key === 'composer.composerData') return { value: migratedData };
+          return undefined;
+        }),
+        all: vi.fn(() => []),
+        run: vi.fn(),
+      })),
+      close: vi.fn(),
+      runSQL: vi.fn(),
+    });
+
+    const workspaces = await findWorkspaces('/data');
+    expect(workspaces).toHaveLength(1);
+    expect(workspaces[0]!.migrated).toBe(true);
+    expect(workspaces[0]!.sessionCount).toBe(0);
+    expect(workspaces[0]!.id).toBe('ws-migrated');
+  });
+});
+
+describe('listSessions (global merge)', () => {
+  it('merges global sessions into workspace-discovered sessions', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ folder: 'file:///Users/dev/project' })
+    );
+
+    const wsComposerData = JSON.stringify({
+      allComposers: [
+        { composerId: 'old-session', name: 'Old Session', createdAt: 1700000000000, lastUpdatedAt: 1700000000000 },
+      ],
+    });
+
+    const globalComposerData = JSON.stringify({
+      name: 'New Session',
+      createdAt: 1775340000000,
+      lastUpdatedAt: 1775341000000,
+    });
+
+    mockOpenDatabase.mockImplementation(async (path: string) => {
+      if (String(path).includes('globalStorage')) {
+        return {
+          prepare: vi.fn((sql: string) => {
+            if (sql.includes('sqlite_master')) {
+              return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+            }
+            if (sql.includes("LIKE 'composerData:%'")) {
+              return {
+                get: vi.fn(),
+                all: vi.fn(() => [
+                  { key: 'composerData:new-session', value: globalComposerData },
+                  { key: 'composerData:old-session', value: JSON.stringify({ name: 'Old Session Global', createdAt: 1700000000000 }) },
+                ]),
+                run: vi.fn(),
+              };
+            }
+            if (sql.includes('GROUP BY')) {
+              return {
+                get: vi.fn(),
+                all: vi.fn(() => [
+                  { cid: 'new-session', cnt: 10 },
+                  { cid: 'old-session', cnt: 5 },
+                ]),
+                run: vi.fn(),
+              };
+            }
+            return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+          }),
+          close: vi.fn(),
+          runSQL: vi.fn(),
+        };
+      }
+      return createWorkspaceDb(wsComposerData);
+    });
+
+    const sessions = await listSessions({ limit: 0, all: true }, '/data');
+
+    const ids = sessions.map((s) => s.id);
+    expect(ids).toContain('old-session');
+    expect(ids).toContain('new-session');
+    // old-session found via workspace should NOT be duplicated by global
+    expect(ids.filter((id) => id === 'old-session')).toHaveLength(1);
+  });
+
+  it('deduplicates: workspace-discovered session wins over global', async () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readdirSync).mockReturnValue([
+      { name: 'ws1', isDirectory: () => true } as unknown as ReturnType<typeof readdirSync>[0],
+    ]);
+    vi.mocked(readFileSync).mockReturnValue(
+      JSON.stringify({ folder: 'file:///Users/dev/project' })
+    );
+
+    const wsComposerData = JSON.stringify({
+      allComposers: [
+        { composerId: 'shared-id', name: 'Workspace Version', createdAt: 1700000000000, lastUpdatedAt: 1700000000000 },
+      ],
+    });
+
+    const globalComposerData = JSON.stringify({
+      name: 'Global Version',
+      createdAt: 1700000000000,
+    });
+
+    mockOpenDatabase.mockImplementation(async (path: string) => {
+      if (String(path).includes('globalStorage')) {
+        return {
+          prepare: vi.fn((sql: string) => {
+            if (sql.includes('sqlite_master')) {
+              return { get: vi.fn(() => ({ name: 'cursorDiskKV' })), all: vi.fn(() => []), run: vi.fn() };
+            }
+            if (sql.includes("LIKE 'composerData:%'")) {
+              return {
+                get: vi.fn(),
+                all: vi.fn(() => [{ key: 'composerData:shared-id', value: globalComposerData }]),
+                run: vi.fn(),
+              };
+            }
+            if (sql.includes('GROUP BY')) {
+              return { get: vi.fn(), all: vi.fn(() => [{ cid: 'shared-id', cnt: 3 }]), run: vi.fn() };
+            }
+            return { get: vi.fn(), all: vi.fn(() => []), run: vi.fn() };
+          }),
+          close: vi.fn(),
+          runSQL: vi.fn(),
+        };
+      }
+      return createWorkspaceDb(wsComposerData);
+    });
+
+    const sessions = await listSessions({ limit: 0, all: true }, '/data');
+
+    const matched = sessions.filter((s) => s.id === 'shared-id');
+    expect(matched).toHaveLength(1);
+    expect(matched[0]!.workspaceId).toBe('ws1');
+  });
+});
+
+describe('parseChatData (migrated format)', () => {
+  it('returns empty array for migrated workspace data', async () => {
+    const { parseChatData } = await import('../../src/core/parser.js');
+    const migrated = JSON.stringify({
+      hasMigratedComposerData: true,
+      selectedComposerIds: ['abc'],
+    });
+    const result = parseChatData(migrated);
+    expect(result).toEqual([]);
+  });
+
+  it('still parses allComposers even when hasMigratedComposerData is set', async () => {
+    const { parseChatData } = await import('../../src/core/parser.js');
+    const stale = JSON.stringify({
+      hasMigratedComposerData: true,
+      allComposers: [{ composerId: 'c1', name: 'Stale', createdAt: 1700000000000 }],
+    });
+    const result = parseChatData(stale);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe('c1');
   });
 });

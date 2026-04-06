@@ -187,23 +187,50 @@ function countSessions(dbPath: string): number {
   try {
     const db = registry.openSync(dbPath, { readonly: true });
     try {
-      // Try to read composer data
-      const row = db
-        .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-        .get() as { value: string } | undefined;
-      if (row) {
-        const data = JSON.parse(row.value) as { allComposers?: unknown[] } | unknown[];
-        if (Array.isArray(data)) {
-          return data.length;
+      // Try workspace-local ItemTable first (may not exist in filtered backups)
+      try {
+        const row = db
+          .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+          .get() as { value: string } | undefined;
+        if (row) {
+          const data = JSON.parse(row.value) as {
+            allComposers?: unknown[];
+            hasMigratedComposerData?: boolean;
+          } | unknown[];
+          if (Array.isArray(data)) {
+            return data.length;
+          }
+          if (data.allComposers && Array.isArray(data.allComposers)) {
+            return data.allComposers.length;
+          }
+          if (!Array.isArray(data) && data.hasMigratedComposerData) {
+            return countSessionsFromDiskKV(db);
+          }
         }
-        if (data.allComposers && Array.isArray(data.allComposers)) {
-          return data.allComposers.length;
-        }
+      } catch {
+        // ItemTable doesn't exist (e.g. filtered global DB) -- fall through
       }
-      return 0;
+
+      return countSessionsFromDiskKV(db);
     } finally {
       db.close();
     }
+  } catch {
+    return 0;
+  }
+}
+
+function countSessionsFromDiskKV(db: ReturnType<typeof registry.openSync>): number {
+  try {
+    const tableCheck = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'")
+      .get();
+    if (!tableCheck) return 0;
+
+    const result = db
+      .prepare("SELECT COUNT(*) as count FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+      .get() as { count: number } | undefined;
+    return result?.count ?? 0;
   } catch {
     return 0;
   }
@@ -268,7 +295,9 @@ function readComposerHeads(dbPath: string): ComposerHead[] {
         .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
         .get() as { value: string } | undefined;
       if (!row) return [];
-      const data = JSON.parse(row.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
+      const data = JSON.parse(row.value) as
+        | { allComposers?: ComposerHead[]; hasMigratedComposerData?: boolean }
+        | ComposerHead[];
       if (Array.isArray(data)) return data;
       return data.allComposers ?? [];
     } finally {
@@ -280,7 +309,50 @@ function readComposerHeads(dbPath: string): ComposerHead[] {
 }
 
 /**
- * Get session IDs from all workspace DBs whose lastUpdatedAt >= since.
+ * Read composer heads from the global cursorDiskKV table.
+ */
+function readGlobalComposerHeads(globalDbPath: string): ComposerHead[] {
+  try {
+    const db = registry.openSync(globalDbPath, { readonly: true });
+    try {
+      const tableCheck = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'")
+        .get();
+      if (!tableCheck) return [];
+
+      const rows = db
+        .prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+        .all() as { key: string; value: string }[];
+
+      const heads: ComposerHead[] = [];
+      for (const row of rows) {
+        try {
+          const data = JSON.parse(row.value) as {
+            composerId?: string;
+            createdAt?: number;
+            lastUpdatedAt?: number;
+          } | null;
+          if (!data) continue;
+          heads.push({
+            composerId: data.composerId ?? row.key.replace('composerData:', ''),
+            createdAt: typeof data.createdAt === 'number' ? data.createdAt : undefined,
+            lastUpdatedAt: typeof data.lastUpdatedAt === 'number' ? data.lastUpdatedAt : undefined,
+          });
+        } catch {
+          continue;
+        }
+      }
+      return heads;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get session IDs from all workspace DBs and global DB whose lastUpdatedAt >= since.
  */
 function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
   const cutoff = since.getTime();
@@ -289,6 +361,7 @@ function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
 
   if (!existsSync(basePath)) return ids;
 
+  // Scan workspace DBs
   try {
     const entries = readdirSync(basePath, { withFileTypes: true });
     for (const entry of entries) {
@@ -307,6 +380,23 @@ function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
   } catch {
     // Directory not readable
   }
+
+  // Scan global cursorDiskKV (catches sessions migrated out of workspace DBs)
+  try {
+    const globalDbPath = join(basePath, '..', 'globalStorage', 'state.vscdb');
+    if (existsSync(globalDbPath)) {
+      for (const head of readGlobalComposerHeads(globalDbPath)) {
+        if (!head.composerId) continue;
+        const ts = head.lastUpdatedAt ?? head.createdAt ?? 0;
+        if (ts >= cutoff) {
+          ids.add(head.composerId);
+        }
+      }
+    }
+  } catch {
+    // Best-effort
+  }
+
   return ids;
 }
 
