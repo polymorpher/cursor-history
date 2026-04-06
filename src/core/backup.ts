@@ -401,15 +401,66 @@ function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
 }
 
 /**
- * Check whether a workspace DB has any session updated on or after `since`.
+ * Check whether a workspace DB has any session updated on or after `since`,
+ * or contains pane-key references to any of the already-filtered session IDs.
  */
-function shouldIncludeWorkspace(dbPath: string, since: Date): boolean {
+function shouldIncludeWorkspace(
+  dbPath: string,
+  since: Date,
+  filteredIds?: Set<string>
+): boolean {
   const cutoff = since.getTime();
+
+  // Legacy path: check allComposers timestamps
   for (const head of readComposerHeads(dbPath)) {
     const ts = head.lastUpdatedAt ?? head.createdAt ?? 0;
     if (ts >= cutoff) return true;
   }
+
+  // Post-migration: check if any filtered session IDs appear in workspace pane keys
+  if (filteredIds && filteredIds.size > 0) {
+    const paneSessionIds = readWorkspacePaneSessionIds(dbPath);
+    for (const id of paneSessionIds) {
+      if (filteredIds.has(id)) return true;
+    }
+  }
+
   return false;
+}
+
+/**
+ * Extract session IDs referenced by composerChatViewPane keys in a workspace DB.
+ * Each pane value contains keys like "workbench.panel.aichat.view.<sessionId>".
+ */
+function readWorkspacePaneSessionIds(dbPath: string): string[] {
+  try {
+    const db = registry.openSync(dbPath, { readonly: true });
+    try {
+      const rows = db
+        .prepare("SELECT value FROM ItemTable WHERE key LIKE 'workbench.panel.composerChatViewPane.%'")
+        .all() as { value: string }[];
+
+      const ids: string[] = [];
+      for (const row of rows) {
+        try {
+          const paneData = JSON.parse(row.value) as Record<string, unknown>;
+          for (const key of Object.keys(paneData)) {
+            const match = key.match(/^workbench\.panel\.aichat\.view\.(.+)$/);
+            if (match?.[1]) {
+              ids.push(match[1]);
+            }
+          }
+        } catch {
+          continue;
+        }
+      }
+      return ids;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -490,76 +541,131 @@ function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): { added: n
   let updated = 0;
 
   try {
-    const localRow = localDb
-      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
-      .get() as { value: string } | undefined;
-
-    const backupDb = registry.openSync(backupDbPath, { readonly: true });
-    let backupRow: { value: string } | undefined;
+    // --- Merge allComposers (legacy, still useful for pre-migration workspaces) ---
     try {
-      backupRow = backupDb
+      const localRow = localDb
         .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
         .get() as { value: string } | undefined;
-    } finally {
-      backupDb.close();
-    }
 
-    if (!backupRow) return { added: 0, updated: 0 };
+      const backupDb = registry.openSync(backupDbPath, { readonly: true });
+      let backupRow: { value: string } | undefined;
+      try {
+        backupRow = backupDb
+          .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+          .get() as { value: string } | undefined;
+      } finally {
+        backupDb.close();
+      }
 
-    const backupData = JSON.parse(backupRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
-    const backupComposers: ComposerHead[] = Array.isArray(backupData) ? backupData : (backupData.allComposers ?? []);
+      if (backupRow) {
+        const backupData = JSON.parse(backupRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[];
+        const backupComposers: ComposerHead[] = Array.isArray(backupData) ? backupData : (backupData.allComposers ?? []);
 
-    if (backupComposers.length === 0) return { added: 0, updated: 0 };
+        if (backupComposers.length > 0) {
+          const localData = localRow
+            ? (JSON.parse(localRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[])
+            : { allComposers: [] };
+          const isNewFormat = !Array.isArray(localData);
+          const localComposers: ComposerHead[] = Array.isArray(localData) ? localData : (localData.allComposers ?? []);
 
-    const localData = localRow
-      ? (JSON.parse(localRow.value) as { allComposers?: ComposerHead[] } | ComposerHead[])
-      : { allComposers: [] };
-    const isNewFormat = !Array.isArray(localData);
-    const localComposers: ComposerHead[] = Array.isArray(localData) ? localData : (localData.allComposers ?? []);
+          const localById = new Map<string, ComposerHead>();
+          for (const c of localComposers) {
+            if (c.composerId) localById.set(c.composerId, c);
+          }
 
-    const localById = new Map<string, ComposerHead>();
-    for (const c of localComposers) {
-      if (c.composerId) localById.set(c.composerId, c);
-    }
+          const merged: ComposerHead[] = [...localComposers];
 
-    const merged: ComposerHead[] = [...localComposers];
+          for (const bc of backupComposers) {
+            if (!bc.composerId) continue;
+            const existing = localById.get(bc.composerId);
+            if (!existing) {
+              merged.push(bc);
+              added++;
+            } else {
+              const backupTs = bc.lastUpdatedAt ?? bc.createdAt ?? 0;
+              const localTs = existing.lastUpdatedAt ?? existing.createdAt ?? 0;
+              if (backupTs > localTs) {
+                const idx = merged.indexOf(existing);
+                if (idx !== -1) merged[idx] = bc;
+                updated++;
+              }
+            }
+          }
 
-    for (const bc of backupComposers) {
-      if (!bc.composerId) continue;
-      const existing = localById.get(bc.composerId);
-      if (!existing) {
-        merged.push(bc);
-        added++;
-      } else {
-        const backupTs = bc.lastUpdatedAt ?? bc.createdAt ?? 0;
-        const localTs = existing.lastUpdatedAt ?? existing.createdAt ?? 0;
-        if (backupTs > localTs) {
-          const idx = merged.indexOf(existing);
-          if (idx !== -1) merged[idx] = bc;
-          updated++;
+          if (added > 0 || updated > 0) {
+            let dataToWrite: unknown;
+            if (isNewFormat) {
+              dataToWrite = { ...(localData as object), allComposers: merged };
+            } else {
+              dataToWrite = merged;
+            }
+
+            const jsonValue = JSON.stringify(dataToWrite);
+            if (localRow) {
+              localDb.prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'").run(jsonValue);
+            } else {
+              localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', ?)").run(jsonValue);
+            }
+          }
         }
       }
+    } catch {
+      // allComposers merge failed (e.g. migrated workspace) -- continue to pane merge
     }
 
-    if (added === 0 && updated === 0) return { added: 0, updated: 0 };
-
-    let dataToWrite: unknown;
-    if (isNewFormat) {
-      dataToWrite = { ...(localData as object), allComposers: merged };
-    } else {
-      dataToWrite = merged;
-    }
-
-    const jsonValue = JSON.stringify(dataToWrite);
-    if (localRow) {
-      localDb.prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerData'").run(jsonValue);
-    } else {
-      localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', ?)").run(jsonValue);
-    }
+    // --- Merge workspace pane keys (Cursor 3.0 sidebar references) ---
+    added += mergeWorkspacePaneKeys(backupDbPath, localDb);
   } finally {
     localDb.close();
   }
   return { added, updated };
+}
+
+/**
+ * Merge composerChatViewPane and aichat pane keys from a backup workspace DB
+ * into an already-open local workspace DB. These keys are what Cursor 3.0 uses
+ * to populate its sidebar session list.
+ * Returns the number of pane entries added.
+ */
+function mergeWorkspacePaneKeys(
+  backupDbPath: string,
+  localDb: ReturnType<typeof registry.openSync>
+): number {
+  let paneKeysAdded = 0;
+
+  try {
+    const backupDb = registry.openSync(backupDbPath, { readonly: true });
+    try {
+      const paneRows = backupDb
+        .prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'workbench.panel.composerChatViewPane.%'")
+        .all() as { key: string; value: string }[];
+
+      const aichatRows = backupDb
+        .prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'workbench.panel.aichat.%'")
+        .all() as { key: string; value: string }[];
+
+      const upsert = localDb.prepare(
+        'INSERT OR IGNORE INTO ItemTable (key, value) VALUES (?, ?)'
+      );
+
+      for (const row of paneRows) {
+        const result = upsert.run(row.key, row.value);
+        if (typeof result === 'object' && result !== null && 'changes' in result) {
+          paneKeysAdded += (result as { changes: number }).changes;
+        }
+      }
+
+      for (const row of aichatRows) {
+        upsert.run(row.key, row.value);
+      }
+    } finally {
+      backupDb.close();
+    }
+  } catch {
+    // Pane key merge is best-effort
+  }
+
+  return paneKeysAdded;
 }
 
 /**
@@ -668,7 +774,7 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
     // Determine which workspace DBs to include
     for (const file of allDbFiles) {
       if (file.type === 'workspace-db' && file.workspaceId) {
-        if (shouldIncludeWorkspace(file.absolutePath, since)) {
+        if (shouldIncludeWorkspace(file.absolutePath, since, filteredIds)) {
           includedWorkspaceIds.add(file.workspaceId);
         }
       }
