@@ -91,14 +91,33 @@ export interface DatabaseFileInfo {
   /** File size in bytes */
   size: number;
   /** File type */
-  type: 'global-db' | 'workspace-db' | 'workspace-json';
+  type: 'global-db' | 'workspace-db' | 'workspace-json' | 'transcript';
   /** Workspace ID (for workspace DBs) */
   workspaceId?: string;
+  /** Session ID (for transcript files) */
+  sessionId?: string;
 }
 
 /**
- * T008: Scan for all database files in the Cursor data directory
- * Discovers globalStorage/state.vscdb and workspaceStorage/{id}/state.vscdb
+ * Derive the ~/.cursor/projects/ slug from a workspace file URI.
+ * e.g. "file:///Users/polymorpher/git/cursor-history" -> "Users-polymorpher-git-cursor-history"
+ */
+export function workspaceUriToProjectSlug(uri: string): string {
+  const fsPath = uri.replace(/^file:\/\//, '');
+  return fsPath.replace(/^\//, '').replace(/[/.]/g, '-');
+}
+
+/**
+ * Get the ~/.cursor/projects directory path.
+ */
+function getCursorProjectsPath(): string {
+  return join(homedir(), '.cursor', 'projects');
+}
+
+/**
+ * Scan for all data files in the Cursor data directory.
+ * Discovers globalStorage/state.vscdb, workspaceStorage state.vscdb files,
+ * and agent transcript JSONL files under ~/.cursor/projects/.
  */
 export function scanDatabaseFiles(dataPath: string): DatabaseFileInfo[] {
   const files: DatabaseFileInfo[] = [];
@@ -157,6 +176,41 @@ export function scanDatabaseFiles(dataPath: string): DatabaseFileInfo[] {
       }
     } catch {
       // Directory might not be accessible
+    }
+  }
+
+  // Scan ~/.cursor/projects/*/agent-transcripts/ for JSONL transcript files
+  const projectsDir = getCursorProjectsPath();
+  if (existsSync(projectsDir)) {
+    try {
+      const projectEntries = readdirSync(projectsDir, { withFileTypes: true });
+      for (const projEntry of projectEntries) {
+        if (projEntry.isDirectory() === false) continue;
+        const transcriptDir = join(projectsDir, projEntry.name, 'agent-transcripts');
+        if (existsSync(transcriptDir) === false) continue;
+
+        try {
+          const sessionDirs = readdirSync(transcriptDir, { withFileTypes: true });
+          for (const sessionDir of sessionDirs) {
+            if (sessionDir.isDirectory() === false) continue;
+            const jsonlPath = join(transcriptDir, sessionDir.name, `${sessionDir.name}.jsonl`);
+            if (existsSync(jsonlPath) === false) continue;
+
+            const stat = statSync(jsonlPath);
+            files.push({
+              absolutePath: jsonlPath,
+              relativePath: `projects/${projEntry.name}/agent-transcripts/${sessionDir.name}/${sessionDir.name}.jsonl`,
+              size: stat.size,
+              type: 'transcript',
+              sessionId: sessionDir.name,
+            });
+          }
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      // Projects directory not accessible
     }
   }
 
@@ -785,6 +839,7 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
   const dbFiles = since
     ? allDbFiles.filter((f) => {
         if (f.type === 'global-db') return true;
+        if (f.type === 'transcript') return f.sessionId ? filteredIds!.has(f.sessionId) : false;
         if (f.workspaceId) return includedWorkspaceIds.has(f.workspaceId);
         return false;
       })
@@ -1246,7 +1301,11 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
 
       // Convert forward slashes to platform-specific separators
       const platformPath = fileEntry.path.split('/').join(sep);
-      const destPath = join(userDir, platformPath);
+
+      // Transcript files go to ~/.cursor/, not under userDir
+      const destPath = fileEntry.path.startsWith('projects/')
+        ? join(homedir(), '.cursor', platformPath)
+        : join(userDir, platformPath);
 
       // Create directory structure
       mkdirSync(dirname(destPath), { recursive: true });
@@ -1418,6 +1477,39 @@ async function restoreBackupMerge(
       // No local global DB yet: just copy it
       mkdirSync(dirname(localGlobalDbPath), { recursive: true });
       writeFileSync(localGlobalDbPath, readFileSync(backupGlobalDbPath));
+    }
+
+    // Copy agent transcript JSONL files to ~/.cursor/projects/
+    const backupProjectsDir = join(tempDir, 'projects');
+    if (existsSync(backupProjectsDir)) {
+      const localProjectsDir = getCursorProjectsPath();
+      try {
+        const projEntries = readdirSync(backupProjectsDir, { withFileTypes: true });
+        for (const projEntry of projEntries) {
+          if (projEntry.isDirectory() === false) continue;
+          const backupTranscriptsDir = join(backupProjectsDir, projEntry.name, 'agent-transcripts');
+          if (existsSync(backupTranscriptsDir) === false) continue;
+
+          const localTranscriptsDir = join(localProjectsDir, projEntry.name, 'agent-transcripts');
+          const sessionDirs = readdirSync(backupTranscriptsDir, { withFileTypes: true });
+          for (const sessionDir of sessionDirs) {
+            if (sessionDir.isDirectory() === false) continue;
+            const destSessionDir = join(localTranscriptsDir, sessionDir.name);
+            if (existsSync(destSessionDir)) continue; // Don't overwrite existing transcripts
+
+            mkdirSync(destSessionDir, { recursive: true });
+            const backupFiles = readdirSync(join(backupTranscriptsDir, sessionDir.name));
+            for (const f of backupFiles) {
+              writeFileSync(
+                join(destSessionDir, f),
+                readFileSync(join(backupTranscriptsDir, sessionDir.name, f))
+              );
+            }
+          }
+        }
+      } catch {
+        // Transcript restore is best-effort
+      }
     }
 
     onProgress?.({

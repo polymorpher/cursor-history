@@ -403,7 +403,7 @@ export interface BackupFileEntry {
   checksum: string;
 
   /** File type for categorization */
-  type: 'global-db' | 'workspace-db' | 'workspace-json' | 'manifest';
+  type: 'global-db' | 'workspace-db' | 'workspace-json' | 'manifest' | 'transcript';
 }
 
 /**
