@@ -39,6 +39,8 @@ export interface Workspace {
   path: string;
   dbPath: string;
   sessionCount: number;
+  /** True when workspace composer data has been migrated to global storage */
+  migrated?: boolean;
 }
 
 /**

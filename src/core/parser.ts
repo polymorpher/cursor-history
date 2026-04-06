@@ -39,6 +39,7 @@ interface RawMessage {
 interface ComposerData {
   allComposers?: ComposerHead[];
   selectedComposerIds?: string[];
+  hasMigratedComposerData?: boolean;
 }
 
 interface ComposerHead {
@@ -79,6 +80,11 @@ export function parseChatData(jsonString: string, bundle?: CursorChatBundle): Ch
   try {
     data = JSON.parse(jsonString) as RawChatData | ComposerData;
   } catch {
+    return [];
+  }
+
+  // Migrated workspace: session data moved to global cursorDiskKV
+  if ('hasMigratedComposerData' in data && !('allComposers' in data && data.allComposers)) {
     return [];
   }
 
