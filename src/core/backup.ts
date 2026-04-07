@@ -82,6 +82,41 @@ export class ZipReader {
     };
   }
 
+  /**
+   * Stream a zip entry directly to a file on disk (no memory buffering).
+   */
+  extractToFile(entryPath: string, destPath: string): Promise<void> {
+    const entry = this.entries.get(entryPath);
+    if (!entry) return Promise.reject(new Error(`Entry not found: ${entryPath}`));
+    return new Promise((resolve, reject) => {
+      this.zipfile.openReadStream(entry, (err, stream) => {
+        if (err || !stream) return reject(err ?? new Error('No stream'));
+        const out = createWriteStream(destPath);
+        stream.on('error', reject);
+        out.on('error', reject);
+        out.on('close', resolve);
+        stream.pipe(out);
+      });
+    });
+  }
+
+  /**
+   * Compute SHA-256 checksum of a zip entry via streaming.
+   */
+  checksumEntry(entryPath: string): Promise<string> {
+    const entry = this.entries.get(entryPath);
+    if (!entry) return Promise.reject(new Error(`Entry not found: ${entryPath}`));
+    return new Promise((resolve, reject) => {
+      this.zipfile.openReadStream(entry, (err, stream) => {
+        if (err || !stream) return reject(err ?? new Error('No stream'));
+        const hash = createHash('sha256');
+        stream.on('data', (chunk: Buffer) => hash.update(chunk));
+        stream.on('end', () => resolve(`sha256:${hash.digest('hex')}`));
+        stream.on('error', reject);
+      });
+    });
+  }
+
   close(): void {
     try { this.zipfile.close(); } catch { /* ignore */ }
   }
@@ -1165,20 +1200,19 @@ export async function openBackupDatabase(
   dbPath: string
 ): Promise<DatabaseInterface> {
   const zip = await ZipReader.open(backupPath);
-  const dbFile = zip.file(dbPath);
 
-  if (!dbFile) {
+  if (!zip.file(dbPath)) {
+    zip.close();
     throw new Error(`Database not found in backup: ${dbPath}`);
   }
 
-  const buffer = await dbFile.async('nodebuffer');
-
-  // Extract to temp file since SQLite needs file access
+  // Stream directly to temp file (handles entries > 2GB)
   const tempFile = join(
     tmpdir(),
     `cursor_history_backup_${Date.now()}_${Math.random().toString(36).slice(2)}.vscdb`
   );
-  writeFileSync(tempFile, buffer);
+  await zip.extractToFile(dbPath, tempFile);
+  zip.close();
 
   // Use pluggable driver system - registry.openSync requires driver to already be selected
   let db: DatabaseInterface | null = null;
@@ -1285,8 +1319,8 @@ export async function validateBackup(backupPath: string): Promise<BackupValidati
       continue;
     }
 
-    const buffer = await file.async('nodebuffer');
-    const actualChecksum = computeChecksum(buffer);
+    // Stream checksum to avoid buffering large files (>2GB)
+    const actualChecksum = await zip.checksumEntry(fileEntry.path);
     if (actualChecksum === fileEntry.checksum) {
       validFiles.push(fileEntry.path);
     } else {
@@ -1414,8 +1448,6 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
         continue; // Skip missing files
       }
 
-      const buffer = await file.async('nodebuffer');
-
       // Convert forward slashes to platform-specific separators
       const platformPath = fileEntry.path.split('/').join(sep);
 
@@ -1427,8 +1459,8 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
       // Create directory structure
       mkdirSync(dirname(destPath), { recursive: true });
 
-      // Write file
-      writeFileSync(destPath, buffer);
+      // Stream directly to file (handles entries > 2GB)
+      await zip.extractToFile(fileEntry.path, destPath);
       restoredFiles.push(fileEntry.path);
     }
 
@@ -1516,14 +1548,12 @@ async function restoreBackupMerge(
 
     for (let i = 0; i < manifest.files.length; i++) {
       const fileEntry = manifest.files[i]!;
-      const file = zip.file(fileEntry.path);
-      if (!file) continue;
+      if (!zip.file(fileEntry.path)) continue;
 
-      const buffer = await file.async('nodebuffer');
       const platformPath = fileEntry.path.split('/').join(sep);
       const destPath = join(tempDir, platformPath);
       mkdirSync(dirname(destPath), { recursive: true });
-      writeFileSync(destPath, buffer);
+      await zip.extractToFile(fileEntry.path, destPath);
 
       onProgress?.({
         phase: 'extracting',
