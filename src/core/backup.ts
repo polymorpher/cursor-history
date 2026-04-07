@@ -21,11 +21,71 @@ import {
   createWriteStream,
   createReadStream,
 } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
-import JSZip from 'jszip';
 import yazl from 'yazl';
+import yauzl from 'yauzl';
+
+/**
+ * Promisified yauzl wrapper: read a zip file and extract entries by path.
+ * Replaces JSZip for reading (supports ZIP64 and large files).
+ */
+class ZipReader {
+  private entries = new Map<string, yauzl.Entry>();
+  private zipfile: yauzl.ZipFile;
+
+  private constructor(zipfile: yauzl.ZipFile, entries: Map<string, yauzl.Entry>) {
+    this.zipfile = zipfile;
+    this.entries = entries;
+  }
+
+  static open(zipPath: string): Promise<ZipReader> {
+    return new Promise((resolve, reject) => {
+      yauzl.open(zipPath, { lazyEntries: false, autoClose: false }, (err, zipfile) => {
+        if (err || !zipfile) return reject(err ?? new Error('Failed to open zip'));
+        const entries = new Map<string, yauzl.Entry>();
+        zipfile.on('entry', (entry: yauzl.Entry) => {
+          entries.set(entry.fileName, entry);
+        });
+        zipfile.on('end', () => resolve(new ZipReader(zipfile, entries)));
+        zipfile.on('error', reject);
+      });
+    });
+  }
+
+  static async fromBuffer(data: Buffer, tempDir?: string): Promise<ZipReader> {
+    // yauzl needs a file path; write buffer to temp file
+    const tempPath = join(tempDir ?? tmpdir(), `.zip_read_${Date.now()}.zip`);
+    writeFileSync(tempPath, data);
+    try {
+      return await ZipReader.open(tempPath);
+    } finally {
+      try { unlinkSync(tempPath); } catch { /* ignore */ }
+    }
+  }
+
+  file(path: string): { async: (type: 'nodebuffer') => Promise<Buffer> } | null {
+    const entry = this.entries.get(path);
+    if (!entry) return null;
+    const zf = this.zipfile;
+    return {
+      async: (_type: 'nodebuffer') =>
+        new Promise<Buffer>((resolve, reject) => {
+          zf.openReadStream(entry, (err, stream) => {
+            if (err || !stream) return reject(err ?? new Error('No stream'));
+            const chunks: Buffer[] = [];
+            stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+            stream.on('end', () => resolve(Buffer.concat(chunks)));
+            stream.on('error', reject);
+          });
+        }),
+    };
+  }
+
+  close(): void {
+    try { this.zipfile.close(); } catch { /* ignore */ }
+  }
+}
 import type { Database as DatabaseInterface, Statement } from './database/types.js';
 import { registry } from './database/registry.js';
 import { backupDatabase } from './database/index.js';
@@ -998,7 +1058,7 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
     for (const entry of fileEntries) {
       const filePath = join(tempDir, entry.path);
       const zipPath = entry.path.split(sep).join('/');
-      zipFile.addFile(filePath, zipPath);
+      zipFile.addFile(filePath, zipPath, { compress: false });
     }
 
     // Add manifest
@@ -1104,8 +1164,7 @@ export async function openBackupDatabase(
   backupPath: string,
   dbPath: string
 ): Promise<DatabaseInterface> {
-  const data = await readFile(backupPath);
-  const zip = await JSZip.loadAsync(data);
+  const zip = await ZipReader.open(backupPath);
   const dbFile = zip.file(dbPath);
 
   if (!dbFile) {
@@ -1145,10 +1204,10 @@ export async function openBackupDatabase(
  */
 export async function readBackupManifest(backupPath: string): Promise<BackupManifest | null> {
   try {
-    const data = await readFile(backupPath);
-    const zip = await JSZip.loadAsync(data);
+    const zip = await ZipReader.open(backupPath);
     const manifestFile = zip.file('manifest.json');
     if (!manifestFile) {
+      zip.close();
       return null;
     }
     const manifestBuffer = await manifestFile.async('nodebuffer');
@@ -1179,10 +1238,9 @@ export async function validateBackup(backupPath: string): Promise<BackupValidati
   }
 
   // Try to open as zip
-  let zip: JSZip;
+  let zip: ZipReader;
   try {
-    const data = await readFile(backupPath);
-    zip = await JSZip.loadAsync(data);
+    zip = await ZipReader.open(backupPath);
   } catch (e) {
     return {
       status: 'invalid',
@@ -1334,8 +1392,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   });
 
   // Phase: Extracting
-  const data = await readFile(backupPath);
-  const zip = await JSZip.loadAsync(data);
+  const zip = await ZipReader.open(backupPath);
   const restoredFiles: string[] = [];
   const warnings: string[] = validation.corruptedFiles.map((f) => `Checksum mismatch: ${f}`);
 
@@ -1455,8 +1512,7 @@ async function restoreBackupMerge(
     });
 
     // Extract all files from backup to temp
-    const zipData = await readFile(backupPath);
-    const zip = await JSZip.loadAsync(zipData);
+    const zip = await ZipReader.open(backupPath);
 
     for (let i = 0; i < manifest.files.length; i++) {
       const fileEntry = manifest.files[i]!;

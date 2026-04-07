@@ -98,9 +98,61 @@ vi.mock('yazl', () => {
         addFile() {}
         addBuffer() {}
         end() {
-          // Simulate async zip completion
           process.nextTick(() => this.outputStream.end());
         }
+      },
+    },
+  };
+});
+
+// Mock yauzl - zip reader (used by ZipReader wrapper)
+vi.mock('yauzl', () => {
+  return {
+    default: {
+      open: (_path: string, _opts: unknown, cb: (err: Error | null, zf?: unknown) => void) => {
+        Promise.resolve(mockZipLoadAsync()).then((mockResult) => {
+          if (!mockResult) {
+            cb(new Error('Mock zip not configured'));
+            return;
+          }
+          const { EventEmitter } = require('node:events');
+          const { PassThrough } = require('node:stream');
+          const zipfile = new EventEmitter();
+
+          const mockFile = mockResult.file as (name: string) => { async: (t: string) => Promise<Buffer> } | null;
+
+          (zipfile as Record<string, unknown>).openReadStream = (
+            entry: { fileName: string },
+            streamCb: (err: Error | null, stream?: unknown) => void
+          ) => {
+            const f = mockFile(entry.fileName);
+            if (!f) { streamCb(new Error('not found')); return; }
+            f.async('nodebuffer').then((buf: Buffer) => {
+              const s = new PassThrough();
+              process.nextTick(() => { s.push(buf); s.push(null); });
+              streamCb(null, s);
+            });
+          };
+          (zipfile as Record<string, unknown>).close = () => {};
+
+          process.nextTick(() => {
+            // Emit entries for paths the test might query
+            const testPaths = [
+              'manifest.json',
+              'globalStorage/state.vscdb',
+              'test.db',
+              'workspaceStorage/ws1/state.vscdb',
+              'workspaceStorage/ws1/workspace.json',
+            ];
+            for (const p of testPaths) {
+              if (mockFile(p)) {
+                zipfile.emit('entry', { fileName: p });
+              }
+            }
+            zipfile.emit('end');
+          });
+          cb(null, zipfile);
+        }).catch((err: Error) => cb(err));
       },
     },
   };
