@@ -31,10 +31,12 @@ cursor-history restore /path/to/backup.zip --merge
 ```
 
 The merge automatically:
-- Copies new workspace folders as-is
-- Merges sessions into existing workspaces (matched by project path, not hash)
-- Imports missing global database entries (full AI responses)
-- Deduplicates by session ID — safe to run repeatedly
+- Imports session data into the global database (`cursorDiskKV`)
+- Merges session headers into the Cursor sidebar index (`composer.composerHeaders`)
+- Copies workspace pane keys for UI state
+- Copies agent transcript JSONL files for sidebar visibility
+- Matches workspaces by project path (not hash) for cross-machine compatibility
+- Deduplicates by session ID -- safe to run repeatedly
 
 ### Verify
 
@@ -63,97 +65,30 @@ cursor-history restore /path/to/backup.zip --merge
 | Windows | `%APPDATA%/Cursor/User/` |
 
 Inside this directory:
-- `globalStorage/state.vscdb` — full AI responses and bubble data for all sessions
-- `workspaceStorage/{hash}/state.vscdb` — per-workspace session metadata
-- `workspaceStorage/{hash}/workspace.json` — maps the hash folder to a project path
+- `globalStorage/state.vscdb` -- global database with two key tables:
+  - `cursorDiskKV`: session data (`composerData:*`), bubble content (`bubbleId:*`), checkpoints, etc.
+  - `ItemTable`: sidebar session index (`composer.composerHeaders`), UI state, telemetry
+- `workspaceStorage/{hash}/state.vscdb` -- per-workspace UI state (pane keys, layout)
+- `workspaceStorage/{hash}/workspace.json` -- maps the hash folder to a project path
 
-## Manual Method
+Additional data in `~/.cursor/`:
+- `projects/{slug}/agent-transcripts/{sessionId}/{sessionId}.jsonl` -- conversation transcripts
+- `ai-tracking/ai-code-tracking.db` -- AI attribution data (not backed up)
 
-If you need finer control, you can extract the backup to a temp location and merge manually.
+### Cursor 3.0 Storage Migration
 
-### Step 1: Back Up Both Machines
-
-```bash
-cursor-history backup
-```
-
-### Step 2: Extract to Temp Location
-
-```bash
-cursor-history restore /path/to/backup.zip --target /tmp/cursor-restore/workspaceStorage
-```
-
-This extracts `globalStorage/` and `workspaceStorage/` into `/tmp/cursor-restore/`.
-
-### Step 3: Fully Quit Cursor
-
-Cursor caches database state in memory and will overwrite changes on disk.
-
-### Step 4: Check for Collisions
-
-```bash
-ls /tmp/cursor-restore/workspaceStorage/ > /tmp/backup_ids.txt
-ls "$HOME/Library/Application Support/Cursor/User/workspaceStorage/" > /tmp/local_ids.txt
-comm -12 <(sort /tmp/backup_ids.txt) <(sort /tmp/local_ids.txt)
-```
-
-### Step 5: Copy Non-Colliding Workspace Folders
-
-```bash
-CURSOR_USER="$HOME/Library/Application Support/Cursor/User"
-
-comm -23 <(sort /tmp/backup_ids.txt) <(sort /tmp/local_ids.txt) | while read id; do
-  cp -R "/tmp/cursor-restore/workspaceStorage/$id" "$CURSOR_USER/workspaceStorage/"
-done
-```
-
-### Step 6: Handle Colliding Workspace Folders
-
-For each colliding hash, merge the composer arrays:
-
-```bash
-WORKSPACE_ID="<the colliding hash>"
-BACKUP_DB="/tmp/cursor-restore/workspaceStorage/$WORKSPACE_ID/state.vscdb"
-LOCAL_DB="$CURSOR_USER/workspaceStorage/$WORKSPACE_ID/state.vscdb"
-
-BACKUP_DATA=$(sqlite3 "$BACKUP_DB" "SELECT value FROM ItemTable WHERE key = 'composer.composerData';")
-LOCAL_DATA=$(sqlite3 "$LOCAL_DB" "SELECT value FROM ItemTable WHERE key = 'composer.composerData';")
-
-MERGED=$(echo "$LOCAL_DATA" | jq --argjson backup "$BACKUP_DATA" '
-  .allComposers += ($backup.allComposers // [])
-  | .allComposers |= unique_by(.composerId)
-')
-
-sqlite3 "$LOCAL_DB" "UPDATE ItemTable SET value = '$(echo "$MERGED" | jq -c .)' WHERE key = 'composer.composerData';"
-```
-
-### Step 7: Merge the Global Database
-
-```bash
-sqlite3 "$CURSOR_USER/globalStorage/state.vscdb" \
-  "ATTACH '/tmp/cursor-restore/globalStorage/state.vscdb' AS backup;
-   INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV;"
-```
-
-### Step 8: Verify and Reopen Cursor
-
-```bash
-cursor-history list --all --json | jq '.count'
-```
-
-Then reopen Cursor. Clean up the temp directory once verified:
-
-```bash
-rm -rf /tmp/cursor-restore
-```
+Cursor 3.0 moved session metadata from per-workspace `composer.composerData` arrays to the global `cursorDiskKV` table (individual `composerData:*` rows). The sidebar session list is now stored in `composer.composerHeaders` in the global `ItemTable`. The backup/restore tool handles both pre- and post-migration formats automatically.
 
 ## Troubleshooting
 
 **Sessions show up in `cursor-history list` but not in Cursor's sidebar:**
-Cursor was not fully quit before the merge. Quit Cursor completely (Cmd+Q / force quit) and reopen.
+Cursor must be fully quit (Cmd+Q / force quit) before the merge restore. Cursor overwrites workspace DB state on startup, so restoring while Cursor is running has no effect. If you already restored while Cursor was open, quit Cursor, re-run the restore, then reopen.
 
 **`restore` says "Target directory already has Cursor data":**
-Use `--merge` to import sessions, or `--force` to overwrite everything.
+Use `--merge` to import sessions, or `--force` to overwrite everything. Prefer `--merge` to avoid losing existing data on the target machine.
 
 **Workspace hashes differ between machines for the same project:**
 The `--merge` mode matches workspaces by project path (from `workspace.json`), not by hash folder name. It handles same-path-different-hash cases automatically.
+
+**Full backup fails with "File size is greater than 2 GiB":**
+Update to the latest version. Backup now uses streaming zip (yazl) which supports files of any size via ZIP64.

@@ -358,6 +358,10 @@ cursor-history migrate --force /old/project /existing/project
 # Create a backup of all chat history
 cursor-history backup
 
+# Only sessions from the last N days (much smaller/faster)
+cursor-history backup -r 7d
+cursor-history backup --since 2026-03-13
+
 # Create backup to specific file
 cursor-history backup -o ~/my-backup.zip
 
@@ -370,14 +374,11 @@ cursor-history list-backups
 # List backups in a specific directory
 cursor-history list-backups -d /path/to/backups
 
-# Restore from a backup
-cursor-history restore ~/cursor-history-backups/backup.zip
+# Merge backup into existing data (for cross-machine sync)
+cursor-history restore backup.zip --merge
 
-# Restore to a custom location
-cursor-history restore backup.zip --target /custom/cursor/data
-
-# Force overwrite existing data
-cursor-history restore backup.zip --force
+# Restore from a backup (overwrite)
+cursor-history restore ~/cursor-history-backups/backup.zip --force
 
 # View sessions from a backup without restoring
 cursor-history list --backup ~/backup.zip
@@ -385,6 +386,8 @@ cursor-history show 1 --backup ~/backup.zip
 cursor-history search "query" --backup ~/backup.zip
 cursor-history export 1 --backup ~/backup.zip
 ```
+
+See [LOCAL_MIGRATION.md](LOCAL_MIGRATION.md) for cross-machine migration workflows.
 
 ### Global Options
 
