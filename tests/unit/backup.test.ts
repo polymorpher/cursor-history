@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 // Mock node:fs
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+  const { PassThrough } = await import('node:stream');
   return {
     ...actual,
     existsSync: vi.fn(),
@@ -15,6 +16,20 @@ vi.mock('node:fs', async () => {
     statSync: vi.fn(),
     unlinkSync: vi.fn(),
     rmdirSync: vi.fn(),
+    createWriteStream: vi.fn(() => {
+      const stream = new PassThrough();
+      // Simulate file write completing
+      process.nextTick(() => stream.emit('close'));
+      return stream;
+    }),
+    createReadStream: vi.fn(() => {
+      const stream = new PassThrough();
+      process.nextTick(() => {
+        stream.push(Buffer.from('data'));
+        stream.push(null);
+      });
+      return stream;
+    }),
   };
 });
 
@@ -71,6 +86,24 @@ vi.mock('jszip', () => {
   }
   MockJSZip.loadAsync = mockZipLoadAsync;
   return { default: MockJSZip };
+});
+
+// Mock yazl - streaming zip writer
+vi.mock('yazl', () => {
+  const { PassThrough } = require('node:stream');
+  return {
+    default: {
+      ZipFile: class MockZipFile {
+        outputStream = new PassThrough();
+        addFile() {}
+        addBuffer() {}
+        end() {
+          // Simulate async zip completion
+          process.nextTick(() => this.outputStream.end());
+        }
+      },
+    },
+  };
 });
 
 import { existsSync, mkdirSync, readdirSync, statSync, readFileSync } from 'node:fs';
@@ -405,10 +438,6 @@ describe('createBackup', () => {
     });
     vi.mocked(statSync).mockReturnValue({ size: 1024 } as ReturnType<typeof statSync>);
     vi.mocked(readFileSync).mockReturnValue(Buffer.from('database-content'));
-
-    const { writeFile: mockWriteFile } = await import('node:fs/promises');
-    vi.mocked(mockWriteFile).mockResolvedValue(undefined);
-    mockZipGenerateAsync.mockResolvedValue(Buffer.from('zipdata'));
 
     const result = await createBackup({ outputPath: '/backups/test.zip' });
     expect(result.success).toBe(true);

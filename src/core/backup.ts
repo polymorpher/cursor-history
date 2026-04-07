@@ -18,11 +18,14 @@ import {
   readFileSync,
   writeFileSync,
   rmdirSync,
+  createWriteStream,
+  createReadStream,
 } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
 import JSZip from 'jszip';
+import yazl from 'yazl';
 import type { Database as DatabaseInterface, Statement } from './database/types.js';
 import { registry } from './database/registry.js';
 import { backupDatabase } from './database/index.js';
@@ -62,6 +65,19 @@ export function getDefaultBackupDir(): string {
  */
 export function computeChecksum(buffer: Buffer): string {
   return `sha256:${createHash('sha256').update(buffer).digest('hex')}`;
+}
+
+/**
+ * Compute SHA-256 checksum of a file using streaming (handles files > 2GB).
+ */
+async function computeFileChecksum(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('end', () => resolve(`sha256:${hash.digest('hex')}`));
+    stream.on('error', reject);
+  });
 }
 
 /**
@@ -939,13 +955,13 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
         writeFileSync(tempFilePath, content);
       }
 
-      // Read backed up file and compute checksum
-      const buffer = readFileSync(tempFilePath);
-      const checksum = computeChecksum(buffer);
+      // Compute checksum and file size using streaming (handles > 2GB)
+      const fileSize = statSync(tempFilePath).size;
+      const checksum = await computeFileChecksum(tempFilePath);
 
       fileEntries.push({
         path: dbFile.relativePath,
-        size: buffer.length,
+        size: fileSize,
         checksum,
         type: dbFile.type,
       });
@@ -970,26 +986,23 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       totalBytes,
     });
 
-    // T014: Create zip file
-    const zip = new JSZip();
-
-    // Add all backed up database files
-    for (const entry of fileEntries) {
-      const filePath = join(tempDir, entry.path);
-      // Convert path to use forward slashes for cross-platform compatibility
-      const zipPath = entry.path.split(sep).join('/');
-      const fileContent = readFileSync(filePath);
-      zip.file(zipPath, fileContent);
-    }
-
-    // T015: Create and add manifest
-    const stats: BackupStats = {
+    // T014: Create zip file using streaming (supports files > 2GB via ZIP64)
+    const manifest = createManifest(fileEntries, {
       totalSize: fileEntries.reduce((sum, f) => sum + f.size, 0),
       sessionCount,
       workspaceCount: workspaceIds.size,
-    };
-    const manifest = createManifest(fileEntries, stats);
-    zip.file('manifest.json', JSON.stringify(manifest, null, 2));
+    });
+
+    const zipFile = new yazl.ZipFile();
+
+    for (const entry of fileEntries) {
+      const filePath = join(tempDir, entry.path);
+      const zipPath = entry.path.split(sep).join('/');
+      zipFile.addFile(filePath, zipPath);
+    }
+
+    // Add manifest
+    zipFile.addBuffer(Buffer.from(JSON.stringify(manifest, null, 2)), 'manifest.json');
 
     // Phase: Finalizing
     onProgress?.({
@@ -1000,12 +1013,19 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       totalBytes,
     });
 
-    // Write zip file
+    // Stream zip to output file
     if (existsSync(outputPath)) {
       unlinkSync(outputPath);
     }
-    const zipContent = await zip.generateAsync({ type: 'nodebuffer' });
-    await writeFile(outputPath, zipContent);
+
+    await new Promise<void>((resolve, reject) => {
+      const output = createWriteStream(outputPath);
+      output.on('close', resolve);
+      output.on('error', reject);
+      zipFile.outputStream.on('error', reject);
+      zipFile.outputStream.pipe(output);
+      zipFile.end();
+    });
 
     return {
       success: true,

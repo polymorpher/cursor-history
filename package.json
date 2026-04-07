@@ -77,11 +77,13 @@
     "better-sqlite3": "^12.5.0",
     "commander": "^14.0.2",
     "jszip": "^3.10.1",
-    "picocolors": "^1.1.1"
+    "picocolors": "^1.1.1",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.0.3",
+    "@types/yazl": "^3.3.0",
     "@vitest/coverage-v8": "^4.0.18",
     "eslint": "^9.39.2",
     "prettier": "^3.7.4",
