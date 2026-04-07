@@ -702,17 +702,16 @@ function mergeWorkspacePaneKeys(
         'INSERT OR IGNORE INTO ItemTable (key, value) VALUES (?, ?)'
       );
 
-      const newPaneIds: string[] = [];
+      // Collect ALL pane IDs from the backup (not just newly inserted ones)
+      // so viewContainersWorkspaceState can be checked even on repeat restores.
+      const backupPaneIds: string[] = [];
 
       for (const row of paneRows) {
+        const paneId = row.key.replace('workbench.panel.composerChatViewPane.', '');
+        backupPaneIds.push(paneId);
         const result = upsert.run(row.key, row.value);
         if (typeof result === 'object' && result !== null && 'changes' in result) {
-          const changes = (result as { changes: number }).changes;
-          if (changes > 0) {
-            paneKeysAdded += changes;
-            const paneId = row.key.replace('workbench.panel.composerChatViewPane.', '');
-            newPaneIds.push(paneId);
-          }
+          paneKeysAdded += (result as { changes: number }).changes;
         }
       }
 
@@ -721,7 +720,7 @@ function mergeWorkspacePaneKeys(
       }
 
       // Register new pane containers in viewContainersWorkspaceState so Cursor's sidebar sees them
-      if (newPaneIds.length > 0) {
+      if (backupPaneIds.length > 0) {
         try {
           const vcsRow = localDb
             .prepare("SELECT value FROM ItemTable WHERE key = 'workbench.auxiliarybar.viewContainersWorkspaceState'")
@@ -733,7 +732,7 @@ function mergeWorkspacePaneKeys(
 
           const existingIds = new Set(containers.map((c) => c.id));
           let added = false;
-          for (const paneId of newPaneIds) {
+          for (const paneId of backupPaneIds) {
             const containerId = `workbench.panel.aichat.${paneId}`;
             if (existingIds.has(containerId) === false) {
               containers.push({ id: containerId, visible: false });
