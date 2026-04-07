@@ -904,6 +904,63 @@ function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): n
   }
 }
 
+/**
+ * Merge composer.composerHeaders from backup global DB into local global DB.
+ * This is the Cursor 3.0 sidebar session index stored in the global ItemTable.
+ */
+function mergeComposerHeaders(backupGlobalDbPath: string, localGlobalDbPath: string): void {
+  const localDb = registry.openSync(localGlobalDbPath, { readonly: false });
+  try {
+    const localRow = localDb
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+      .get() as { value: string } | undefined;
+
+    const localData = localRow
+      ? (JSON.parse(localRow.value) as { allComposers?: Array<Record<string, unknown>> })
+      : { allComposers: [] };
+    const localHeaders = localData.allComposers ?? [];
+    const localIds = new Set(localHeaders.map((h) => h['composerId'] as string).filter(Boolean));
+
+    const backupDb = registry.openSync(backupGlobalDbPath, { readonly: true });
+    let backupHeaders: Array<Record<string, unknown>> = [];
+    try {
+      const backupRow = backupDb
+        .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+        .get() as { value: string } | undefined;
+
+      if (backupRow) {
+        const backupData = JSON.parse(backupRow.value) as {
+          allComposers?: Array<Record<string, unknown>>;
+        };
+        backupHeaders = backupData.allComposers ?? [];
+      }
+    } finally {
+      backupDb.close();
+    }
+
+    let added = 0;
+    for (const header of backupHeaders) {
+      const id = header['composerId'] as string;
+      if (id && localIds.has(id) === false) {
+        localHeaders.push(header);
+        localIds.add(id);
+        added++;
+      }
+    }
+
+    if (added === 0) return;
+
+    const merged = JSON.stringify({ allComposers: localHeaders });
+    if (localRow) {
+      localDb.prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'").run(merged);
+    } else {
+      localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)").run(merged);
+    }
+  } finally {
+    localDb.close();
+  }
+}
+
 // ============================================================================
 // Backup Operations (T011-T016)
 // ============================================================================
@@ -1623,6 +1680,15 @@ async function restoreBackupMerge(
       // No local global DB yet: just copy it
       mkdirSync(dirname(localGlobalDbPath), { recursive: true });
       writeFileSync(localGlobalDbPath, readFileSync(backupGlobalDbPath));
+    }
+
+    // Merge composer.composerHeaders in global ItemTable (Cursor 3.0 sidebar index)
+    if (existsSync(localGlobalDbPath) && existsSync(backupGlobalDbPath)) {
+      try {
+        mergeComposerHeaders(backupGlobalDbPath, localGlobalDbPath);
+      } catch {
+        // Best-effort
+      }
     }
 
     // Copy agent transcript JSONL files to ~/.cursor/projects/
