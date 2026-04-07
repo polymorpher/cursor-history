@@ -702,15 +702,56 @@ function mergeWorkspacePaneKeys(
         'INSERT OR IGNORE INTO ItemTable (key, value) VALUES (?, ?)'
       );
 
+      const newPaneIds: string[] = [];
+
       for (const row of paneRows) {
         const result = upsert.run(row.key, row.value);
         if (typeof result === 'object' && result !== null && 'changes' in result) {
-          paneKeysAdded += (result as { changes: number }).changes;
+          const changes = (result as { changes: number }).changes;
+          if (changes > 0) {
+            paneKeysAdded += changes;
+            const paneId = row.key.replace('workbench.panel.composerChatViewPane.', '');
+            newPaneIds.push(paneId);
+          }
         }
       }
 
       for (const row of aichatRows) {
         upsert.run(row.key, row.value);
+      }
+
+      // Register new pane containers in viewContainersWorkspaceState so Cursor's sidebar sees them
+      if (newPaneIds.length > 0) {
+        try {
+          const vcsRow = localDb
+            .prepare("SELECT value FROM ItemTable WHERE key = 'workbench.auxiliarybar.viewContainersWorkspaceState'")
+            .get() as { value: string } | undefined;
+
+          const containers: Array<{ id: string; visible: boolean }> = vcsRow
+            ? (JSON.parse(vcsRow.value) as Array<{ id: string; visible: boolean }>)
+            : [];
+
+          const existingIds = new Set(containers.map((c) => c.id));
+          let added = false;
+          for (const paneId of newPaneIds) {
+            const containerId = `workbench.panel.aichat.${paneId}`;
+            if (existingIds.has(containerId) === false) {
+              containers.push({ id: containerId, visible: false });
+              added = true;
+            }
+          }
+
+          if (added) {
+            const json = JSON.stringify(containers);
+            if (vcsRow) {
+              localDb.prepare("UPDATE ItemTable SET value = ? WHERE key = 'workbench.auxiliarybar.viewContainersWorkspaceState'").run(json);
+            } else {
+              localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('workbench.auxiliarybar.viewContainersWorkspaceState', ?)").run(json);
+            }
+          }
+        } catch {
+          // viewContainersWorkspaceState update is best-effort
+        }
       }
     } finally {
       backupDb.close();
