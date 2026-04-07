@@ -1483,6 +1483,8 @@ async function restoreBackupMerge(
     const backupProjectsDir = join(tempDir, 'projects');
     if (existsSync(backupProjectsDir)) {
       const localProjectsDir = getCursorProjectsPath();
+      let transcriptsCopied = 0;
+      let transcriptsSkipped = 0;
       try {
         const projEntries = readdirSync(backupProjectsDir, { withFileTypes: true });
         for (const projEntry of projEntries) {
@@ -1495,7 +1497,10 @@ async function restoreBackupMerge(
           for (const sessionDir of sessionDirs) {
             if (sessionDir.isDirectory() === false) continue;
             const destSessionDir = join(localTranscriptsDir, sessionDir.name);
-            if (existsSync(destSessionDir)) continue; // Don't overwrite existing transcripts
+            if (existsSync(destSessionDir)) {
+              transcriptsSkipped++;
+              continue;
+            }
 
             mkdirSync(destSessionDir, { recursive: true });
             const backupFiles = readdirSync(join(backupTranscriptsDir, sessionDir.name));
@@ -1505,10 +1510,16 @@ async function restoreBackupMerge(
                 readFileSync(join(backupTranscriptsDir, sessionDir.name, f))
               );
             }
+            transcriptsCopied++;
           }
         }
-      } catch {
-        // Transcript restore is best-effort
+      } catch (transcriptError) {
+        if (transcriptError instanceof Error) {
+          warnings.push(`Transcript restore: ${transcriptError.message}`);
+        }
+      }
+      if (transcriptsCopied > 0 || transcriptsSkipped > 0) {
+        stats.sessionsAdded += transcriptsCopied;
       }
     }
 
