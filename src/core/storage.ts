@@ -3,10 +3,8 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import JSZip from 'jszip';
 import {
   openDatabase as openDatabaseAsync,
   openDatabaseReadWrite as openDatabaseReadWriteAsync,
@@ -29,7 +27,7 @@ import type {
 import { getCursorDataPath, contractPath, normalizePath, pathsEqual } from '../lib/platform.js';
 import { SessionNotFoundError } from '../lib/errors.js';
 import { parseChatData, getSearchSnippets, type CursorChatBundle } from './parser.js';
-import { openBackupDatabase, readBackupManifest } from './backup.js';
+import { openBackupDatabase, readBackupManifest, ZipReader } from './backup.js';
 import { debugLogStorage } from './database/debug.js';
 
 /**
@@ -364,16 +362,17 @@ async function readWorkspaceJsonFromBackup(
   workspaceId: string
 ): Promise<string | null> {
   try {
-    const data = await readFile(backupPath);
-    const zip = await JSZip.loadAsync(data);
+    const zip = await ZipReader.open(backupPath);
     const jsonPath = `workspaceStorage/${workspaceId}/workspace.json`;
     const file = zip.file(jsonPath);
 
     if (!file) {
+      zip.close();
       return null;
     }
 
     const buffer = await file.async('nodebuffer');
+    zip.close();
     const content = buffer.toString('utf-8');
     const jsonData = JSON.parse(content) as WorkspaceJsonShape;
     return getWorkspacePathFromJson(jsonData);

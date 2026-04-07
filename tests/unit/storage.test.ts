@@ -16,6 +16,19 @@ vi.mock('../../src/core/database/index.js', () => ({
 vi.mock('../../src/core/backup.js', () => ({
   openBackupDatabase: vi.fn(),
   readBackupManifest: vi.fn().mockResolvedValue(null),
+  ZipReader: {
+    open: vi.fn().mockImplementation(async () => {
+      const result = await Promise.resolve(mockZipLoadAsync());
+      return {
+        file: (path: string) => {
+          if (!result) return null;
+          const mockFile = result.file;
+          return mockFile ? mockFile(path) : null;
+        },
+        close: () => {},
+      };
+    }),
+  },
 }));
 
 // For backup-from-zip tests: mock zip so readWorkspaceJsonFromBackup can read workspace.json (hoisted)

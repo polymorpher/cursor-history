@@ -30,7 +30,7 @@ import yauzl from 'yauzl';
  * Promisified yauzl wrapper: read a zip file and extract entries by path.
  * Replaces JSZip for reading (supports ZIP64 and large files).
  */
-class ZipReader {
+export class ZipReader {
   private entries = new Map<string, yauzl.Entry>();
   private zipfile: yauzl.ZipFile;
 
