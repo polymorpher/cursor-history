@@ -88,6 +88,7 @@ function formatRestoreResult(result: RestoreResult): string {
       lines.push(`  ${pc.bold('New workspaces:')} ${result.mergeStats.workspacesNew}`);
       lines.push(`  ${pc.bold('Merged workspaces:')} ${result.mergeStats.workspacesMerged}`);
       lines.push(`  ${pc.bold('Global rows added:')} ${result.mergeStats.globalRowsAdded}`);
+      lines.push(`  ${pc.bold('Sidebar headers added:')} ${result.mergeStats.sidebarHeadersAdded}`);
       lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
     } else {
       lines.push(pc.green('✓ Backup restored successfully!'));

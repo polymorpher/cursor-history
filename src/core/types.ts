@@ -420,6 +420,8 @@ export interface MergeStats {
   workspacesMerged: number;
   /** Rows added or updated in global cursorDiskKV */
   globalRowsAdded: number;
+  /** Sidebar index entries added (composer.composerHeaders) */
+  sidebarHeadersAdded: number;
 }
 
 export interface RestoreResult {

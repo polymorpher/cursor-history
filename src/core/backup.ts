@@ -661,6 +661,33 @@ async function createFilteredGlobalDb(
       }
     }
     destDb.runSQL('COMMIT');
+
+    // Copy composer.composerHeaders from ItemTable, filtered to matching sessions.
+    // This is the Cursor 3.0 sidebar index -- without it, merged sessions won't
+    // appear in the target machine's sidebar.
+    try {
+      const headersRow = sourceDb
+        .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+        .get() as { value: string } | undefined;
+
+      if (headersRow) {
+        const parsed = JSON.parse(headersRow.value) as { allComposers?: Array<Record<string, unknown>> };
+        const allHeaders = parsed.allComposers ?? [];
+        const filtered = allHeaders.filter(
+          (h) => typeof h['composerId'] === 'string' && sessionIds.has(h['composerId'] as string)
+        );
+
+        if (filtered.length > 0) {
+          destDb.runSQL('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)');
+          destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS ItemTable_key ON ItemTable(key)');
+          destDb
+            .prepare("INSERT OR IGNORE INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)")
+            .run(JSON.stringify({ allComposers: filtered }));
+        }
+      }
+    } catch {
+      // ItemTable may not exist in older Cursor versions
+    }
   } finally {
     destDb.close();
     sourceDb.close();
@@ -914,8 +941,9 @@ function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): n
 /**
  * Merge composer.composerHeaders from backup global DB into local global DB.
  * This is the Cursor 3.0 sidebar session index stored in the global ItemTable.
+ * Returns the number of header entries added.
  */
-function mergeComposerHeaders(backupGlobalDbPath: string, localGlobalDbPath: string): void {
+function mergeComposerHeaders(backupGlobalDbPath: string, localGlobalDbPath: string): number {
   const localDb = registry.openSync(localGlobalDbPath, { readonly: false });
   try {
     const localRow = localDb
@@ -955,7 +983,7 @@ function mergeComposerHeaders(backupGlobalDbPath: string, localGlobalDbPath: str
       }
     }
 
-    if (added === 0) return;
+    if (added === 0) return 0;
 
     const merged = JSON.stringify({ allComposers: localHeaders });
     if (localRow) {
@@ -963,6 +991,9 @@ function mergeComposerHeaders(backupGlobalDbPath: string, localGlobalDbPath: str
     } else {
       localDb.prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)").run(merged);
     }
+
+    try { localDb.runSQL('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ }
+    return added;
   } finally {
     localDb.close();
   }
@@ -1590,6 +1621,7 @@ async function restoreBackupMerge(
     workspacesNew: 0,
     workspacesMerged: 0,
     globalRowsAdded: 0,
+    sidebarHeadersAdded: 0,
   };
 
   // Extract backup to temp directory
@@ -1692,9 +1724,9 @@ async function restoreBackupMerge(
     // Merge composer.composerHeaders in global ItemTable (Cursor 3.0 sidebar index)
     if (existsSync(localGlobalDbPath) && existsSync(backupGlobalDbPath)) {
       try {
-        mergeComposerHeaders(backupGlobalDbPath, localGlobalDbPath);
+        stats.sidebarHeadersAdded = mergeComposerHeaders(backupGlobalDbPath, localGlobalDbPath);
       } catch {
-        // Best-effort
+        warnings.push('Failed to merge sidebar headers (composer.composerHeaders)');
       }
     }
 
