@@ -780,6 +780,9 @@ function mergeWorkspaceDb(backupDbPath: string, localDbPath: string): { added: n
 
     // --- Merge workspace pane keys (Cursor 3.0 sidebar references) ---
     added += mergeWorkspacePaneKeys(backupDbPath, localDb);
+
+    // Flush WAL to main DB file so Cursor sees changes on next startup
+    try { localDb.runSQL('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ }
   } finally {
     localDb.close();
   }
@@ -898,6 +901,10 @@ function mergeGlobalDb(backupGlobalDbPath: string, localGlobalDbPath: string): n
     db.runSQL('DETACH backup');
 
     const after = (db.prepare('SELECT COUNT(*) as c FROM cursorDiskKV').get() as { c: number }).c;
+
+    // Flush WAL to main DB file so Cursor sees changes on next startup
+    try { db.runSQL('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best-effort */ }
+
     return after - before;
   } finally {
     db.close();
