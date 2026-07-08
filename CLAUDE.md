@@ -64,6 +64,7 @@ src/
 │   ├── storage.ts         # findWorkspaces, listSessions, getSession, extractBubbleText
 │   ├── migrate.ts         # migrateSession, migrateWorkspace, copyBubbleDataInGlobalStorage
 │   ├── backup.ts          # createBackup, restoreBackup, openBackupDatabase
+│   ├── transcript.ts      # synthesizeMissingTranscripts, workspacePathToProjectSlug
 │   ├── parser.ts          # parseChatData, exportToMarkdown, exportToJson
 │   └── types.ts           # ChatSession, Message, Workspace, ToolCall, MigrationMode, etc.
 └── lib/
@@ -295,6 +296,7 @@ try {
 | `export [index]` | Export to md/json (--all, -o, -f, --force) |
 | `migrate-session <session> <dest>` | Move/copy session(s) to workspace (--copy, --dry-run, -f, --debug) |
 | `migrate <source> <dest>` | Move/copy all sessions between workspaces (--copy, --dry-run, -f, --debug) |
+| `fix-transcripts` | Synthesize missing agent transcript files from chat data so sessions are taggable/continuable (--dry-run) |
 
 ### Show Command Options
 
@@ -371,6 +373,13 @@ Edit `extractBubbleText()` in `src/core/storage.ts`. Priority matters:
 - SQLite databases (state.vscdb files) — read-only access (012-fix-session-data-integrity)
 
 ## Recent Changes
+- Transcript synthesis: restored sessions are now taggable/continuable in Cursor
+  - Cursor 3.x only lists a chat in the @-mention "past chats" menu (and resumes it with the unified agent backend) when a transcript exists at `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`; restored sessions had DB data but no transcript file
+  - New `src/core/transcript.ts`: `synthesizeTranscript()` rebuilds the JSONL from bubble data (user text wrapped in `<user_query>`, assistant text + `tool_use` blocks), `synthesizeMissingTranscripts()` scans sessions listed in `composer.composerHeaders`, resolves each session's workspace (header `workspaceIdentifier` → composerData → workspace pane keys) and writes missing transcripts
+  - `workspacePathToProjectSlug()` replicates Cursor's slug rule (all non-alphanumerics → `-`, collapse runs, trim); `workspaceUriToProjectSlug()` in backup.ts now delegates to it (previously only `/` and `.` were replaced, so paths with `_` or spaces mapped to a folder Cursor never reads)
+  - New CLI command `fix-transcripts` (`--dry-run`) to repair an existing machine without re-restoring
+  - `restore` (both merge and force modes) synthesizes missing transcripts by default; opt out with `--no-synth` / `RestoreConfig.synthesizeTranscripts: false`; merge stats gain `transcriptsSynthesized`
+  - Library API: `fixTranscripts()`, `SynthesizeTranscriptsOptions`, `TranscriptSynthesisStats`
 - 012-fix-session-data-integrity: Restored full session fidelity across storage fallbacks
   - Added shared bubble mapping in `src/core/storage.ts` so `getSession()` and `getGlobalSession()` preserve empty bubbles as `[empty message]`, retain malformed rows as `[corrupted message]`, and populate `message.metadata.bubbleType`
   - Populated structured `message.toolCalls` from `toolFormerData`, including default `completed` status handling and `{ _raw: ... }` sentinels for invalid params
