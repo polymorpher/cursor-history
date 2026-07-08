@@ -41,6 +41,7 @@ async function loadCommands() {
   const { registerBackupCommand } = await import('./commands/backup.js');
   const { registerRestoreCommand } = await import('./commands/restore.js');
   const { registerListBackupsCommand } = await import('./commands/list-backups.js');
+  const { registerFixTranscriptsCommand } = await import('./commands/fix-transcripts.js');
 
   registerListCommand(program);
   registerShowCommand(program);
@@ -51,6 +52,7 @@ async function loadCommands() {
   registerBackupCommand(program);
   registerRestoreCommand(program);
   registerListBackupsCommand(program);
+  registerFixTranscriptsCommand(program);
 }
 
 // Main execution
