@@ -385,6 +385,11 @@ export interface RestoreConfig {
   force?: boolean;
   /** Merge backup into existing data instead of overwriting */
   merge?: boolean;
+  /**
+   * Synthesize missing agent transcript JSONL files from bubble data after
+   * restore, so restored sessions are taggable/continuable (default: true)
+   */
+  synthesizeTranscripts?: boolean;
   /** Progress callback for UI updates */
   onProgress?: (progress: RestoreProgress) => void;
 }
@@ -422,6 +427,8 @@ export interface MergeStats {
   globalRowsAdded: number;
   /** Sidebar index entries added (composer.composerHeaders) */
   sidebarHeadersAdded: number;
+  /** Agent transcript files synthesized from bubble data */
+  transcriptsSynthesized: number;
 }
 
 export interface RestoreResult {
@@ -439,6 +446,8 @@ export interface RestoreResult {
   error?: string;
   /** Stats when merge mode is used */
   mergeStats?: MergeStats;
+  /** Agent transcript files synthesized from bubble data (overwrite mode) */
+  transcriptsSynthesized?: number;
 }
 
 /**

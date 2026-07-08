@@ -138,6 +138,7 @@ import type {
 } from './types.js';
 import { readWorkspaceJson } from './storage.js';
 import { normalizePath } from '../lib/platform.js';
+import { synthesizeMissingTranscripts, workspacePathToProjectSlug } from './transcript.js';
 
 // Package version for manifest
 const CURSOR_HISTORY_VERSION = '0.9.2';
@@ -212,10 +213,12 @@ export interface DatabaseFileInfo {
 /**
  * Derive the ~/.cursor/projects/ slug from a workspace file URI.
  * e.g. "file:///Users/polymorpher/git/cursor-history" -> "Users-polymorpher-git-cursor-history"
+ *
+ * Mirrors Cursor's slug rule: every non-alphanumeric character becomes '-',
+ * runs collapse, leading/trailing '-' trimmed (so "_" and spaces map to '-').
  */
 export function workspaceUriToProjectSlug(uri: string): string {
-  const fsPath = uri.replace(/^file:\/\//, '');
-  return fsPath.replace(/^\//, '').replace(/[/.]/g, '-');
+  return workspacePathToProjectSlug(uri);
 }
 
 /**
@@ -904,6 +907,33 @@ function mergeWorkspacePaneKeys(
 }
 
 /**
+ * Read all session IDs (composerData:* keys) from a global DB file.
+ */
+function readGlobalSessionIds(globalDbPath: string): Set<string> {
+  const ids = new Set<string>();
+  try {
+    const db = registry.openSync(globalDbPath, { readonly: true });
+    try {
+      const tableCheck = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'")
+        .get();
+      if (!tableCheck) return ids;
+      const rows = db
+        .prepare("SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+        .all() as Array<{ key: string }>;
+      for (const row of rows) {
+        ids.add(row.key.replace('composerData:', ''));
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Best-effort
+  }
+  return ids;
+}
+
+/**
  * Merge global database entries from backup into local.
  *
  * - composerData:* entries use INSERT OR REPLACE so that updated session
@@ -1463,6 +1493,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   const targetPath = config.targetPath ?? getDefaultCursorDataPath();
   const force = config.force ?? false;
   const merge = config.merge ?? false;
+  const synthesizeTranscriptsEnabled = config.synthesizeTranscripts ?? true;
   const onProgress = config.onProgress;
 
   // Phase: Validating
@@ -1496,7 +1527,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   if (merge) {
     return restoreBackupMerge(
       backupPath, targetPath, userDir, localGlobalDbPath, localWorkspaceStorageDir,
-      manifest, validation, startTime, onProgress
+      manifest, validation, startTime, synthesizeTranscriptsEnabled, onProgress
     );
   }
 
@@ -1567,12 +1598,33 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
       integrityStatus: validation.status === 'warnings' ? 'warnings' : 'passed',
     });
 
+    // Synthesize agent transcripts for restored sessions that lack them, so
+    // they are taggable/continuable in Cursor on this machine.
+    let transcriptsSynthesized = 0;
+    if (synthesizeTranscriptsEnabled && existsSync(localGlobalDbPath)) {
+      try {
+        const synthStats = await synthesizeMissingTranscripts({
+          globalDbPath: localGlobalDbPath,
+          workspaceStorageDir: localWorkspaceStorageDir,
+        });
+        transcriptsSynthesized = synthStats.created;
+        for (const err of synthStats.errors.slice(0, 5)) {
+          warnings.push(`Transcript synthesis: ${err}`);
+        }
+      } catch (e) {
+        warnings.push(
+          `Transcript synthesis failed: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+    }
+
     return {
       success: true,
       targetPath,
       filesRestored: restoredFiles.length,
       warnings,
       durationMs: Date.now() - startTime,
+      ...(transcriptsSynthesized > 0 && { transcriptsSynthesized }),
     };
   } catch (e) {
     // T043: Rollback on failure - delete any files we created
@@ -1612,6 +1664,7 @@ async function restoreBackupMerge(
   manifest: BackupManifest,
   validation: BackupValidation,
   startTime: number,
+  synthesizeTranscriptsEnabled: boolean,
   onProgress?: (progress: import('./types.js').RestoreProgress) => void,
 ): Promise<RestoreResult> {
   const warnings: string[] = validation.corruptedFiles.map((f) => `Checksum mismatch: ${f}`);
@@ -1622,6 +1675,7 @@ async function restoreBackupMerge(
     workspacesMerged: 0,
     globalRowsAdded: 0,
     sidebarHeadersAdded: 0,
+    transcriptsSynthesized: 0,
   };
 
   // Extract backup to temp directory
@@ -1771,6 +1825,30 @@ async function restoreBackupMerge(
       }
       if (transcriptsCopied > 0 || transcriptsSkipped > 0) {
         stats.sessionsAdded += transcriptsCopied;
+      }
+    }
+
+    // Synthesize agent transcripts for merged sessions that still lack one.
+    // Without the JSONL file Cursor can neither tag the chat as past-chat
+    // context nor resume it with the unified agent backend.
+    if (synthesizeTranscriptsEnabled && existsSync(backupGlobalDbPath) && existsSync(localGlobalDbPath)) {
+      try {
+        const restoredIds = readGlobalSessionIds(backupGlobalDbPath);
+        if (restoredIds.size > 0) {
+          const synthStats = await synthesizeMissingTranscripts({
+            globalDbPath: localGlobalDbPath,
+            workspaceStorageDir: localWorkspaceStorageDir,
+            sessionIds: restoredIds,
+          });
+          stats.transcriptsSynthesized = synthStats.created;
+          for (const err of synthStats.errors.slice(0, 5)) {
+            warnings.push(`Transcript synthesis: ${err}`);
+          }
+        }
+      } catch (e) {
+        warnings.push(
+          `Transcript synthesis failed: ${e instanceof Error ? e.message : String(e)}`
+        );
       }
     }
 

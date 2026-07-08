@@ -14,6 +14,7 @@ interface RestoreCommandOptions {
   target?: string;
   force?: boolean;
   merge?: boolean;
+  synth?: boolean;
   json?: boolean;
   dataPath?: string;
 }
@@ -66,6 +67,9 @@ function formatRestoreResultJson(result: RestoreResult): string {
       ...(result.warnings.length > 0 && { warnings: result.warnings }),
       ...(result.error && { error: result.error }),
       ...(result.mergeStats && { mergeStats: result.mergeStats }),
+      ...(result.transcriptsSynthesized !== undefined && {
+        transcriptsSynthesized: result.transcriptsSynthesized,
+      }),
     },
     null,
     2
@@ -89,12 +93,18 @@ function formatRestoreResult(result: RestoreResult): string {
       lines.push(`  ${pc.bold('Merged workspaces:')} ${result.mergeStats.workspacesMerged}`);
       lines.push(`  ${pc.bold('Global rows added:')} ${result.mergeStats.globalRowsAdded}`);
       lines.push(`  ${pc.bold('Sidebar headers added:')} ${result.mergeStats.sidebarHeadersAdded}`);
+      lines.push(
+        `  ${pc.bold('Transcripts synthesized:')} ${result.mergeStats.transcriptsSynthesized}`
+      );
       lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
     } else {
       lines.push(pc.green('✓ Backup restored successfully!'));
       lines.push('');
       lines.push(`  ${pc.bold('Target:')} ${contractPath(result.targetPath)}`);
       lines.push(`  ${pc.bold('Files restored:')} ${result.filesRestored}`);
+      if (result.transcriptsSynthesized !== undefined) {
+        lines.push(`  ${pc.bold('Transcripts synthesized:')} ${result.transcriptsSynthesized}`);
+      }
       lines.push(`  ${pc.bold('Duration:')} ${formatDuration(result.durationMs)}`);
     }
 
@@ -129,6 +139,7 @@ export function registerRestoreCommand(program: Command): void {
     )
     .option('-f, --force', 'Overwrite existing data without prompting')
     .option('-m, --merge', 'Merge backup into existing data instead of overwriting')
+    .option('--no-synth', 'Skip synthesizing missing agent transcripts after restore')
     .action(async (backupArg: string, options: RestoreCommandOptions, command: Command) => {
       const globalOptions = command.parent?.opts() as { json?: boolean; dataPath?: string };
       const useJson = options.json ?? globalOptions?.json ?? false;
@@ -199,6 +210,7 @@ export function registerRestoreCommand(program: Command): void {
           targetPath,
           force: options.force ?? false,
           merge: options.merge ?? false,
+          synthesizeTranscripts: options.synth ?? true,
           onProgress,
         });
 
