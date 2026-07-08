@@ -780,7 +780,9 @@ export {
   validateBackup,
   listBackups,
   getDefaultBackupDir,
+  fixTranscripts,
 } from './backup.js';
+export type { SynthesizeTranscriptsOptions, TranscriptSynthesisStats } from './backup.js';
 
 // ============================================================================
 // SQLite Driver Functions

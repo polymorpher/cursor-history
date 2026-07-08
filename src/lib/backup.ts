@@ -12,6 +12,11 @@ import {
   listBackups as coreListBackups,
   getDefaultBackupDir as coreGetDefaultBackupDir,
 } from '../core/backup.js';
+import {
+  synthesizeMissingTranscripts,
+  type SynthesizeTranscriptsOptions,
+  type TranscriptSynthesisStats,
+} from '../core/transcript.js';
 
 import type {
   BackupConfig,
@@ -126,3 +131,30 @@ export async function listBackups(directory?: string): Promise<BackupInfo[]> {
 export function getDefaultBackupDir(): string {
   return coreGetDefaultBackupDir();
 }
+
+/**
+ * Synthesize missing agent transcript JSONL files from chat bubble data.
+ *
+ * Cursor only lists a chat as taggable "past chat" context (and can only
+ * resume it with the unified agent backend) when a transcript file exists at
+ * ~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl. Sessions
+ * restored from another machine typically lack these files.
+ *
+ * @param options - Optional synthesis options (dryRun, sessionIds, custom paths)
+ * @returns Promise resolving to synthesis stats
+ *
+ * @example
+ * ```typescript
+ * import { fixTranscripts } from 'cursor-history';
+ *
+ * const stats = await fixTranscripts({ dryRun: true });
+ * console.log(`${stats.created} transcripts would be created`);
+ * ```
+ */
+export async function fixTranscripts(
+  options?: SynthesizeTranscriptsOptions
+): Promise<TranscriptSynthesisStats> {
+  return synthesizeMissingTranscripts(options);
+}
+
+export type { SynthesizeTranscriptsOptions, TranscriptSynthesisStats };
