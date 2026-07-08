@@ -9,8 +9,19 @@ import {
 } from '../../src/core/parser.js';
 import type { ChatSession, Message } from '../../src/core/types.js';
 
-function msg(role: 'user' | 'assistant', content: string): Message {
-  return { id: null, role, content, timestamp: new Date('2024-01-15T10:00:00Z'), codeBlocks: [] };
+function msg(
+  role: 'user' | 'assistant',
+  content: string,
+  overrides: Partial<Message> = {}
+): Message {
+  return {
+    id: null,
+    role,
+    content,
+    timestamp: new Date('2024-01-15T10:00:00Z'),
+    codeBlocks: [],
+    ...overrides,
+  };
 }
 
 function session(overrides: Partial<ChatSession> = {}): ChatSession {
@@ -110,6 +121,22 @@ describe('parseChatData', () => {
     expect(result[0]!.id).toBe('c1');
     expect(result[0]!.title).toBe('My Chat');
     expect(result[0]!.messages[0]!.content).toBe('My Chat');
+  });
+
+  it('parses composer sessions from root-level composer array', () => {
+    const data = [
+      {
+        composerId: 'c-array-1',
+        name: 'Array Chat',
+        createdAt: 1705300000000,
+        lastUpdatedAt: 1705303600000,
+      },
+    ];
+
+    const result = parseChatData(JSON.stringify(data));
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe('c-array-1');
+    expect(result[0]!.title).toBe('Array Chat');
   });
 
   it('uses (Empty session) for composer without name', () => {
@@ -383,6 +410,17 @@ describe('exportToMarkdown', () => {
     expect(md).toContain('**Date**: 2024-01-15');
     expect(md).toContain('**Messages**: 2');
   });
+
+  it('renders message IDs only when available', () => {
+    const md = exportToMarkdown(
+      session({
+        messages: [msg('user', 'Hello', { id: 'bubble-1' }), msg('assistant', 'Hi there!')],
+      })
+    );
+
+    expect(md).toContain('**ID**: `bubble-1`');
+    expect(md.match(/\*\*ID\*\*:/g)).toHaveLength(1);
+  });
 });
 
 // =============================================================================
@@ -420,5 +458,36 @@ describe('exportToJson', () => {
     expect(parsed.messages[0].content).toBe('Hello');
     expect(parsed.messages[0].timestamp).toBe('2024-01-15T10:00:00.000Z');
     expect(parsed.messages[0].codeBlocks).toEqual([]);
+  });
+
+  it('includes message IDs only when available', () => {
+    const parsed = JSON.parse(
+      exportToJson(
+        session({
+          messages: [msg('user', 'Hello', { id: 'bubble-1' }), msg('assistant', 'Hi there!')],
+        })
+      )
+    );
+
+    expect(parsed.messages[0].id).toBe('bubble-1');
+    expect(parsed.messages[1].id).toBeUndefined();
+  });
+
+  it('includes activeBranchBubbleIds when defined', () => {
+    const parsed = JSON.parse(
+      exportToJson(
+        session({
+          activeBranchBubbleIds: ['bubble-1', 'bubble-2'],
+        })
+      )
+    );
+
+    expect(parsed.activeBranchBubbleIds).toEqual(['bubble-1', 'bubble-2']);
+  });
+
+  it('omits activeBranchBubbleIds when undefined', () => {
+    const parsed = JSON.parse(exportToJson(session()));
+
+    expect(parsed.activeBranchBubbleIds).toBeUndefined();
   });
 });

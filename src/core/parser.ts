@@ -75,7 +75,7 @@ export interface CursorChatBundle {
  * Handles both legacy and new Cursor formats
  */
 export function parseChatData(jsonString: string, bundle?: CursorChatBundle): ChatSession[] {
-  let data: RawChatData | ComposerData;
+  let data: RawChatData | ComposerData | ComposerHead[];
 
   try {
     data = JSON.parse(jsonString) as RawChatData | ComposerData;
@@ -84,13 +84,22 @@ export function parseChatData(jsonString: string, bundle?: CursorChatBundle): Ch
   }
 
   // Migrated workspace: session data moved to global cursorDiskKV
-  if ('hasMigratedComposerData' in data && !('allComposers' in data && data.allComposers)) {
+  if (
+    !Array.isArray(data) &&
+    'hasMigratedComposerData' in data &&
+    !('allComposers' in data && data.allComposers)
+  ) {
     return [];
   }
 
-  // Check if this is the new composer format
-  if ('allComposers' in data && data.allComposers) {
+  // New composer format with allComposers wrapper
+  if (isComposerData(data)) {
     return parseComposerFormat(data as ComposerData, bundle);
+  }
+
+  // Legacy composer format stored as a direct array
+  if (isComposerArray(data)) {
+    return parseComposerFormat({ allComposers: data }, bundle);
   }
 
   // Legacy format
@@ -106,6 +115,24 @@ export function parseChatData(jsonString: string, bundle?: CursorChatBundle): Ch
   }
 
   return sessions;
+}
+
+function isComposerData(data: RawChatData | ComposerData | ComposerHead[]): data is ComposerData {
+  return !!data && typeof data === 'object' && !Array.isArray(data) && 'allComposers' in data;
+}
+
+function isComposerArray(data: RawChatData | ComposerData | ComposerHead[]): data is ComposerHead[] {
+  if (!Array.isArray(data) || data.length === 0) {
+    return false;
+  }
+
+  return data.every(
+    (item) =>
+      !!item &&
+      typeof item === 'object' &&
+      !Array.isArray(item) &&
+      ('composerId' in item || 'name' in item || 'unifiedMode' in item)
+  );
 }
 
 /**
@@ -426,6 +453,10 @@ export function exportToMarkdown(session: ChatSession, workspacePath?: string): 
     const roleLabel = message.role === 'user' ? '**User**' : '**Assistant**';
     lines.push(`### ${roleLabel}`);
     lines.push('');
+    if (message.id) {
+      lines.push(`**ID**: \`${message.id}\``);
+      lines.push('');
+    }
     lines.push(message.content);
     lines.push('');
   }
@@ -468,10 +499,14 @@ export function exportToJson(session: ChatSession, workspacePath?: string): stri
       exportData['usage'] = usage;
     }
   }
+  if (session.activeBranchBubbleIds !== undefined) {
+    exportData['activeBranchBubbleIds'] = session.activeBranchBubbleIds;
+  }
 
   // Map messages with token usage fields
   exportData['messages'] = session.messages.map((m) => {
     const msg: Record<string, unknown> = {
+      id: m.id ?? undefined,
       role: m.role,
       content: m.content,
       timestamp: m.timestamp.toISOString(),
