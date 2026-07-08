@@ -86,6 +86,15 @@ export const betterSqlite3Driver: DatabaseDriver = {
       throw new Error('better-sqlite3 is not loaded. Call isAvailable() first.');
     }
     const db = new BetterSqlite3(path, { readonly: options.readonly });
+    // All LIKE queries in this codebase are exact-case key-prefix matches
+    // (e.g. 'bubbleId:<id>:%'). Case-sensitive LIKE lets SQLite satisfy them
+    // via the key index instead of a full table scan, which matters on
+    // multi-GB state.vscdb files.
+    try {
+      db.pragma('case_sensitive_like = ON');
+    } catch {
+      // Pragma is a performance optimization only
+    }
     debugLog(`Opened database with better-sqlite3: ${path} (readonly: ${options.readonly})`);
     return new BetterSqlite3Database(db);
   },

@@ -1010,7 +1010,10 @@ function getGlobalComposerSummary(
     }
 
     return buildGlobalComposerSummary(db, composerId, composerData, {
-      bubbleCount: bubbleCounts?.get(composerId),
+      // The precomputed map covers the whole bubble table: a missing entry
+      // means zero bubbles. Never fall back to a per-composer COUNT query
+      // (a LIKE scan of a potentially multi-GB table) when the map exists.
+      bubbleCount: bubbleCounts ? (bubbleCounts.get(composerId) ?? 0) : undefined,
     });
   } catch {
     return null;
@@ -1060,7 +1063,8 @@ function getGlobalComposerSummariesForWorkspace(
     }
 
     const summary = buildGlobalComposerSummary(db, record.id, record.data, {
-      bubbleCount: bubbleCounts?.get(record.id),
+      // Missing map entry = zero bubbles; avoid the per-composer COUNT fallback
+      bubbleCount: bubbleCounts ? (bubbleCounts.get(record.id) ?? 0) : undefined,
     });
     if (summary) {
       summaries.push(summary);
