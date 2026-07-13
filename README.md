@@ -374,8 +374,19 @@ cursor-history list-backups
 # List backups in a specific directory
 cursor-history list-backups -d /path/to/backups
 
-# Merge backup into existing data (for cross-machine sync)
+# Preview a cross-machine import without changing target data
+cursor-history restore backup.zip --merge --dry-run
+
+# Import disjoint sessions (default conflict strategy: abort)
 cursor-history restore backup.zip --merge
+
+# Preview and apply automatic "newer session wins" resolution
+cursor-history restore backup.zip --merge --dry-run --auto-resolve-conflicts
+cursor-history restore backup.zip --merge --auto-resolve-conflicts
+
+# Or explicitly prefer local/backup versions for every overlap
+cursor-history restore backup.zip --merge --conflict-strategy local
+cursor-history restore backup.zip --merge --conflict-strategy backup
 
 # Restore from a backup (overwrite)
 cursor-history restore ~/cursor-history-backups/backup.zip --force
@@ -386,6 +397,12 @@ cursor-history show 1 --backup ~/backup.zip
 cursor-history search "query" --backup ~/backup.zip
 cursor-history export 1 --backup ~/backup.zip
 ```
+
+Merge restore aborts on overlapping IDs by default. Use
+`--auto-resolve-conflicts` (equivalent to `--conflict-strategy newer`) to update
+only when the backup timestamp is newer, or choose `local`, `backup`, or `abort`
+explicitly. Filtered backups must use `--merge`; they cannot use overwrite
+restore.
 
 See [LOCAL_MIGRATION.md](LOCAL_MIGRATION.md) for cross-machine migration workflows.
 

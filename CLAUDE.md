@@ -296,6 +296,7 @@ try {
 | `export [index]` | Export to md/json (--all, -o, -f, --force) |
 | `migrate-session <session> <dest>` | Move/copy session(s) to workspace (--copy, --dry-run, -f, --debug) |
 | `migrate <source> <dest>` | Move/copy all sessions between workspaces (--copy, --dry-run, -f, --debug) |
+| `restore <backup>` | Preview or restore a backup (`--dry-run`, `--merge`, `--auto-resolve-conflicts`, `--conflict-strategy`, `--force`, `--no-synth`) |
 | `fix-transcripts` | Synthesize missing agent transcript files from chat data so sessions are taggable/continuable (--dry-run) |
 
 ### Show Command Options
@@ -376,6 +377,12 @@ Edit `extractBubbleText()` in `src/core/storage.ts`. Priority matters:
 - TypeScript 5.9+ (strict mode enabled) + commander, picocolors, better-sqlite3/node:sqlite (existing — no new deps) (014-expose-bubble-id)
 
 ## Recent Changes
+- Restore preflight and conflict-aware cross-machine imports
+  - `restore --dry-run` validates the archive, compares backup/local session IDs, and reports file/workspace/transcript actions without modifying target data
+  - `restore --merge` aborts on overlaps by default; `--auto-resolve-conflicts` applies newer-session-wins, while `--conflict-strategy newer|local|backup|abort` provides explicit control
+  - Newer-session resolution updates composer metadata, sidebar headers, workspace metadata, and archived transcripts consistently while preserving existing bubble/checkpoint rows and adding missing ones
+  - Manifest v1.1 records full vs filtered backup scope; filtered backups require `--merge`
+  - Filtered workspace metadata and transcript copying are scoped to the selected session IDs
 - Transcript synthesis: restored sessions are now taggable/continuable in Cursor
   - Cursor 3.x only lists a chat in the @-mention "past chats" menu (and resumes it with the unified agent backend) when a transcript exists at `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`; restored sessions had DB data but no transcript file
   - New `src/core/transcript.ts`: `synthesizeTranscript()` rebuilds the JSONL from bubble data (user text wrapped in `<user_query>`, assistant text + `tool_use` blocks), `synthesizeMissingTranscripts()` scans sessions listed in `composer.composerHeaders`, resolves each session's workspace (header `workspaceIdentifier` → composerData → workspace pane keys) and writes missing transcripts

@@ -24,8 +24,15 @@ Copy the zip file to the destination machine.
 ```bash
 # Fully quit Cursor first (Cmd+Q / force quit)
 
-# Merge backup into existing data
+# Preview the import (no target files are modified)
+cursor-history restore /path/to/backup.zip --merge --dry-run
+
+# Apply when the backup sessions are disjoint
 cursor-history restore /path/to/backup.zip --merge
+
+# If sessions overlap, preview and apply "newer session wins"
+cursor-history restore /path/to/backup.zip --merge --dry-run --auto-resolve-conflicts
+cursor-history restore /path/to/backup.zip --merge --auto-resolve-conflicts
 
 # Reopen Cursor
 ```
@@ -36,7 +43,14 @@ The merge automatically:
 - Copies workspace pane keys for UI state
 - Copies agent transcript JSONL files for sidebar visibility
 - Matches workspaces by project path (not hash) for cross-machine compatibility
-- Deduplicates by session ID -- safe to run repeatedly
+- Aborts on overlapping session IDs by default
+- Can resolve overlaps with `newer`, `local`, or `backup` conflict strategies
+
+`--auto-resolve-conflicts` is shorthand for `--conflict-strategy newer`: backup
+metadata wins only when its timestamp is newer; local-newer sessions are
+skipped. Equal or timestamp-less divergent sessions remain blocked instead of
+being guessed. `--conflict-strategy local` and `backup` explicitly choose one
+side for every overlap.
 
 ### Verify
 
@@ -46,14 +60,15 @@ cursor-history list --all --json | jq '.count'
 
 ### Incremental Sync
 
-For ongoing sync between machines, repeat the same steps with `--recent`:
+For ongoing synchronization, repeat the same steps with `--recent`:
 
 ```bash
 # Source machine: backup only recent changes
 cursor-history backup -r 3d
 
-# Destination machine: merge
-cursor-history restore /path/to/backup.zip --merge
+# Destination machine: preview, then merge using newer-session resolution
+cursor-history restore /path/to/backup.zip --merge --dry-run --auto-resolve-conflicts
+cursor-history restore /path/to/backup.zip --merge --auto-resolve-conflicts
 ```
 
 ## Cursor Data Locations
