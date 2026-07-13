@@ -830,6 +830,26 @@ function buildLocalWorkspaceMap(localWorkspaceStorageDir: string): Map<string, s
   return map;
 }
 
+const RESERVED_WORKSPACE_IDS = new Set(['empty-window']);
+
+function matchLocalWorkspaceFolder(
+  backupWorkspacePath: string | null,
+  workspaceId: string,
+  localPathMap: Map<string, string>,
+  localWorkspaceStorageDir: string
+): string | undefined {
+  if (backupWorkspacePath) {
+    return localPathMap.get(normalizePath(backupWorkspacePath));
+  }
+  if (
+    RESERVED_WORKSPACE_IDS.has(workspaceId) &&
+    existsSync(join(localWorkspaceStorageDir, workspaceId, 'state.vscdb'))
+  ) {
+    return workspaceId;
+  }
+  return undefined;
+}
+
 /**
  * Merge composer sessions from a backup workspace DB into a local workspace DB.
  * Only sessions selected by the restore preflight are added. Existing sessions
@@ -2788,9 +2808,12 @@ async function buildRestorePlan(
         if (!match?.[1]) continue;
         const workspaceId = match[1];
         const backupWorkspacePath = await readBackupWorkspacePath(zip, workspaceId);
-        const localHash = backupWorkspacePath
-          ? localPathMap.get(normalizePath(backupWorkspacePath))
-          : undefined;
+        const localHash = matchLocalWorkspaceFolder(
+          backupWorkspacePath,
+          workspaceId,
+          localPathMap,
+          localWorkspaceStorageDir
+        );
 
         if (localHash) {
           const localDbPath = join(localWorkspaceStorageDir, localHash, 'state.vscdb');
@@ -2896,12 +2919,30 @@ async function buildRestorePlan(
   const sidecars = sqliteTargets.flatMap((path) =>
     [`${path}-wal`, `${path}-shm`, `${path}-journal`].filter((candidate) => existsSync(candidate))
   );
-  if (sidecars.length > 0) {
+  const hazardousSidecars: string[] = [];
+  const inertSidecars: string[] = [];
+  for (const sidecar of sidecars) {
+    try {
+      if (sidecar.endsWith('-shm') || statSync(sidecar).size === 0) {
+        inertSidecars.push(sidecar);
+      } else {
+        hazardousSidecars.push(sidecar);
+      }
+    } catch {
+      hazardousSidecars.push(sidecar);
+    }
+  }
+  if (hazardousSidecars.length > 0) {
     warnings.push(
-      `Found ${sidecars.length} SQLite WAL/SHM/journal sidecar file(s); fully quit Cursor before restore`
+      `Found ${hazardousSidecars.length} non-empty SQLite WAL/journal file(s); fully quit Cursor before restore`
     );
     blockers.push(
-      'Restore is blocked while SQLite sidecar files exist because concurrent or stale pages could invalidate conflict checks and rollback'
+      'Restore is blocked while SQLite WAL/journal frames are pending because they could invalidate conflict checks and rollback'
+    );
+  }
+  if (inertSidecars.length > 0) {
+    warnings.push(
+      `Ignoring ${inertSidecars.length} inert SQLite SHM or zero-byte WAL/journal sidecar file(s)`
     );
   }
 
@@ -3415,10 +3456,14 @@ async function restoreBackupMerge(
         if (!existsSync(backupDbPath)) continue;
 
         const backupWsPath = readWorkspaceJson(backupWsFolder);
-        const normalizedBackupPath = backupWsPath ? normalizePath(backupWsPath) : null;
 
         // Find matching local workspace by path
-        const localHash = normalizedBackupPath ? localPathMap.get(normalizedBackupPath) : undefined;
+        const localHash = matchLocalWorkspaceFolder(
+          backupWsPath,
+          entry.name,
+          localPathMap,
+          localWorkspaceStorageDir
+        );
 
         if (localHash) {
           // Path exists locally: merge into local workspace DB

@@ -351,6 +351,37 @@ describe('restore preflight and additive merge', () => {
     expect(readSessionName(paths.localGlobalDbPath, 'remote-session')).toBeNull();
   });
 
+  it('matches the reserved empty-window workspace by folder ID', async () => {
+    const paths = testPaths();
+    createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
+    createGlobalDatabase(paths.backupDbPath, [{ id: 'remote-session', name: 'Remote' }]);
+    const localWorkspaceDb = join(paths.targetPath, 'empty-window', 'state.vscdb');
+    const backupWorkspaceDb = join(testRoot, 'backup-source', 'empty-window', 'state.vscdb');
+    createWorkspaceDatabase(localWorkspaceDb, [{ id: 'local-session', name: 'Local' }]);
+    createWorkspaceDatabase(backupWorkspaceDb, [{ id: 'remote-session', name: 'Remote' }]);
+    await createBackupArchive(paths.backupDbPath, paths.backupPath, { type: 'full' }, [
+      {
+        path: 'workspaceStorage/empty-window/state.vscdb',
+        content: readFileSync(backupWorkspaceDb),
+        type: 'workspace-db',
+      },
+    ]);
+
+    const result = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      merge: true,
+      dryRun: true,
+      synthesizeTranscripts: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.plan?.workspacesMerged).toBe(1);
+    expect(result.plan?.blockers).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('Workspace folder collision')])
+    );
+  });
+
   it('imports disjoint sessions additively', async () => {
     const paths = testPaths();
     createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
