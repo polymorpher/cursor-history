@@ -67,7 +67,8 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
  *
  * const result = await restoreBackup({
  *   backupPath: '/path/to/backup.zip',
- *   force: true
+ *   merge: true,
+ *   dryRun: true
  * });
  * ```
  */

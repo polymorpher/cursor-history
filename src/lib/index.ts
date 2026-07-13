@@ -24,6 +24,7 @@ export type {
   SessionUsage,
   // Backup types
   BackupManifest,
+  BackupScope,
   BackupFileEntry,
   BackupStats,
   BackupConfig,
@@ -32,6 +33,7 @@ export type {
   RestoreConfig,
   RestoreProgress,
   RestoreResult,
+  RestorePlan,
   MergeStats,
   BackupValidation,
   BackupInfo,
