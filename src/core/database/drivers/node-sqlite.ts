@@ -25,7 +25,10 @@ interface NodeSqliteDatabase {
 }
 
 interface NodeSqliteModule {
-  DatabaseSync: new (path: string, options?: { open?: boolean }) => NodeSqliteDatabase;
+  DatabaseSync: new (
+    path: string,
+    options?: { open?: boolean; readOnly?: boolean }
+  ) => NodeSqliteDatabase;
   backup: (
     sourceDb: NodeSqliteDatabase,
     destPath: string,
@@ -68,8 +71,8 @@ class NodeSqliteStatementWrapper implements Statement {
 /**
  * Wrapper for node:sqlite Database
  *
- * node:sqlite doesn't have native readonly support, so we enforce it
- * at the wrapper level by throwing on write operations.
+ * Native readonly mode is enabled when requested. The wrapper also rejects
+ * write statements as a second layer of protection.
  */
 class NodeSqliteDatabaseWrapper implements Database {
   private nativeDb: NodeSqliteDatabase;
@@ -147,7 +150,7 @@ export const nodeSqliteDriver: DatabaseDriver = {
     if (!nodeSqliteModule) {
       throw new Error('node:sqlite is not loaded. Call isAvailable() first.');
     }
-    const db = new nodeSqliteModule.DatabaseSync(path);
+    const db = new nodeSqliteModule.DatabaseSync(path, { readOnly: options.readonly });
     // All LIKE queries in this codebase are exact-case key-prefix matches
     // (e.g. 'bubbleId:<id>:%'). Case-sensitive LIKE lets SQLite satisfy them
     // via the key index instead of a full table scan, which matters on
