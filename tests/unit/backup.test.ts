@@ -110,49 +110,59 @@ vi.mock('yauzl', () => {
   return {
     default: {
       open: (_path: string, _opts: unknown, cb: (err: Error | null, zf?: unknown) => void) => {
-        Promise.resolve(mockZipLoadAsync()).then((mockResult) => {
-          if (!mockResult) {
-            cb(new Error('Mock zip not configured'));
-            return;
-          }
-          const { EventEmitter } = require('node:events');
-          const { PassThrough } = require('node:stream');
-          const zipfile = new EventEmitter();
-
-          const mockFile = mockResult.file as (name: string) => { async: (t: string) => Promise<Buffer> } | null;
-
-          (zipfile as Record<string, unknown>).openReadStream = (
-            entry: { fileName: string },
-            streamCb: (err: Error | null, stream?: unknown) => void
-          ) => {
-            const f = mockFile(entry.fileName);
-            if (!f) { streamCb(new Error('not found')); return; }
-            f.async('nodebuffer').then((buf: Buffer) => {
-              const s = new PassThrough();
-              process.nextTick(() => { s.push(buf); s.push(null); });
-              streamCb(null, s);
-            });
-          };
-          (zipfile as Record<string, unknown>).close = () => {};
-
-          process.nextTick(() => {
-            // Emit entries for paths the test might query
-            const testPaths = [
-              'manifest.json',
-              'globalStorage/state.vscdb',
-              'test.db',
-              'workspaceStorage/ws1/state.vscdb',
-              'workspaceStorage/ws1/workspace.json',
-            ];
-            for (const p of testPaths) {
-              if (mockFile(p)) {
-                zipfile.emit('entry', { fileName: p });
-              }
+        Promise.resolve(mockZipLoadAsync())
+          .then((mockResult) => {
+            if (!mockResult) {
+              cb(new Error('Mock zip not configured'));
+              return;
             }
-            zipfile.emit('end');
-          });
-          cb(null, zipfile);
-        }).catch((err: Error) => cb(err));
+            const { EventEmitter } = require('node:events');
+            const { PassThrough } = require('node:stream');
+            const zipfile = new EventEmitter();
+
+            const mockFile = mockResult.file as (
+              name: string
+            ) => { async: (t: string) => Promise<Buffer> } | null;
+
+            (zipfile as Record<string, unknown>).openReadStream = (
+              entry: { fileName: string },
+              streamCb: (err: Error | null, stream?: unknown) => void
+            ) => {
+              const f = mockFile(entry.fileName);
+              if (!f) {
+                streamCb(new Error('not found'));
+                return;
+              }
+              f.async('nodebuffer').then((buf: Buffer) => {
+                const s = new PassThrough();
+                process.nextTick(() => {
+                  s.push(buf);
+                  s.push(null);
+                });
+                streamCb(null, s);
+              });
+            };
+            (zipfile as Record<string, unknown>).close = () => {};
+
+            process.nextTick(() => {
+              // Emit entries for paths the test might query
+              const testPaths = [
+                'manifest.json',
+                'globalStorage/state.vscdb',
+                'test.db',
+                'workspaceStorage/ws1/state.vscdb',
+                'workspaceStorage/ws1/workspace.json',
+              ];
+              for (const p of testPaths) {
+                if (mockFile(p)) {
+                  zipfile.emit('entry', { fileName: p });
+                }
+              }
+              zipfile.emit('end');
+            });
+            cb(null, zipfile);
+          })
+          .catch((err: Error) => cb(err));
       },
     },
   };
@@ -269,7 +279,7 @@ describe('createManifest', () => {
     const stats = { totalSize: 100, sessionCount: 5, workspaceCount: 2 };
     const manifest = createManifest(files, stats);
 
-    expect(manifest.version).toBe('1.0.0');
+    expect(manifest.version).toBe('1.1.0');
     expect(manifest.createdAt).toBeDefined();
     // Platform should match the actual OS
     const expectedPlatform =
@@ -277,6 +287,22 @@ describe('createManifest', () => {
     expect(manifest.sourcePlatform).toBe(expectedPlatform);
     expect(manifest.files).toEqual(files);
     expect(manifest.stats).toEqual(stats);
+    expect(manifest.scope).toEqual({ type: 'full' });
+  });
+
+  it('records filtered backup scope', () => {
+    const since = new Date('2026-07-01T00:00:00.000Z');
+    const manifest = createManifest(
+      [],
+      { totalSize: 0, sessionCount: 0, workspaceCount: 0 },
+      { type: 'filtered', since: since.toISOString(), sessionIds: ['session-1'] }
+    );
+
+    expect(manifest.scope).toEqual({
+      type: 'filtered',
+      since: '2026-07-01T00:00:00.000Z',
+      sessionIds: ['session-1'],
+    });
   });
 });
 
