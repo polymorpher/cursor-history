@@ -145,6 +145,7 @@ import type {
   RestoreConfig,
   RestoreResult,
   RestorePlan,
+  RestoreConflictStrategy,
   MergeStats,
   BackupValidation,
   BackupInfo,
@@ -837,19 +838,33 @@ function buildLocalWorkspaceMap(localWorkspaceStorageDir: string): Map<string, s
 function mergeWorkspaceDb(
   backupDbPath: string,
   localDbPath: string,
-  allowedSessionIds: Set<string>
+  allowedSessionIds: Set<string>,
+  updateSessionIds: Set<string>,
+  expectedLocalVersions: Map<string, SessionVersion>,
+  conflictStrategy: RestoreConflictStrategy
 ): { added: number; updated: number } {
   const localDb = registry.openSync(localDbPath, { readonly: false });
   let added = 0;
+  let updated = 0;
   let inTransaction = false;
 
   try {
     localDb.runSQL('BEGIN IMMEDIATE');
     inTransaction = true;
     const currentIds = readWorkspaceSessionIdsFromDatabase(localDb, true);
+    const currentVersions = readWorkspaceSessionVersionsFromDatabase(localDb, true);
     for (const sessionId of allowedSessionIds) {
-      if (currentIds.has(sessionId)) {
+      if (!updateSessionIds.has(sessionId) && currentIds.has(sessionId)) {
         throw new Error(`Session appeared in workspace after preflight: ${sessionId}`);
+      }
+      if (conflictStrategy === 'newer' && updateSessionIds.has(sessionId)) {
+        const expected = expectedLocalVersions.get(sessionId);
+        const current = currentVersions.get(sessionId);
+        if (expected && (!current || expected.fingerprint !== current.fingerprint)) {
+          throw new Error(`Session changed after conflict preflight: ${sessionId}`);
+        } else if (!expected && current) {
+          throw new Error(`Session source appeared after conflict preflight: ${sessionId}`);
+        }
       }
     }
 
@@ -900,10 +915,15 @@ function mergeWorkspaceDb(
               merged.push(bc);
               localById.set(bc.composerId, bc);
               added++;
+            } else if (updateSessionIds.has(bc.composerId)) {
+              const index = merged.indexOf(existing);
+              if (index >= 0) merged[index] = bc;
+              localById.set(bc.composerId, bc);
+              updated++;
             }
           }
 
-          if (added > 0) {
+          if (added > 0 || updated > 0) {
             let dataToWrite: unknown;
             if (isNewFormat) {
               dataToWrite = { ...(localData as object), allComposers: merged };
@@ -932,10 +952,23 @@ function mergeWorkspaceDb(
       );
     }
 
-    added += mergeLegacyWorkspaceChats(backupDbPath, localDb, allowedSessionIds);
+    const legacyResult = mergeLegacyWorkspaceChats(
+      backupDbPath,
+      localDb,
+      allowedSessionIds,
+      updateSessionIds
+    );
+    added += legacyResult.added;
+    updated += legacyResult.updated;
 
     // --- Merge workspace pane keys (Cursor 3.0 sidebar references) ---
-    added += mergeWorkspacePaneKeys(backupDbPath, localDb, allowedSessionIds, true);
+    added += mergeWorkspacePaneKeys(
+      backupDbPath,
+      localDb,
+      allowedSessionIds,
+      updateSessionIds,
+      true
+    );
     localDb.runSQL('COMMIT');
     inTransaction = false;
 
@@ -957,7 +990,7 @@ function mergeWorkspaceDb(
   } finally {
     localDb.close();
   }
-  return { added, updated: 0 };
+  return { added, updated };
 }
 
 function filterWorkspacePaneValue(
@@ -1037,7 +1070,8 @@ function filterLegacyChatData(value: string, allowedSessionIds: Set<string>): st
 function mergeLegacyChatData(
   localValue: string | undefined,
   backupValue: string,
-  allowedSessionIds: Set<string>
+  allowedSessionIds: Set<string>,
+  updateSessionIds: Set<string>
 ): string {
   const filteredBackup = JSON.parse(
     filterLegacyChatData(backupValue, allowedSessionIds)
@@ -1045,19 +1079,29 @@ function mergeLegacyChatData(
   if (!localValue) return JSON.stringify(filteredBackup);
 
   const local = JSON.parse(localValue) as unknown;
-  const appendUnique = (current: unknown[], incoming: unknown[]) => {
-    const ids = new Set(current.map(legacySessionId).filter((id): id is string => id !== null));
-    return [
-      ...current,
-      ...incoming.filter((session) => {
-        const id = legacySessionId(session);
-        return id !== null && ids.has(id) === false;
-      }),
-    ];
+  const mergeSessions = (current: unknown[], incoming: unknown[]) => {
+    const merged = [...current];
+    const indexes = new Map<string, number>();
+    for (let index = 0; index < merged.length; index++) {
+      const id = legacySessionId(merged[index]);
+      if (id) indexes.set(id, index);
+    }
+    for (const session of incoming) {
+      const id = legacySessionId(session);
+      if (!id) continue;
+      const existingIndex = indexes.get(id);
+      if (existingIndex === undefined) {
+        indexes.set(id, merged.length);
+        merged.push(session);
+      } else if (updateSessionIds.has(id)) {
+        merged[existingIndex] = session;
+      }
+    }
+    return merged;
   };
 
   if (Array.isArray(local) && Array.isArray(filteredBackup)) {
-    return JSON.stringify(appendUnique(local, filteredBackup));
+    return JSON.stringify(mergeSessions(local, filteredBackup));
   }
   if (
     !local ||
@@ -1076,7 +1120,7 @@ function mergeLegacyChatData(
     const incoming = backupRecord[key];
     if (!Array.isArray(incoming)) continue;
     const current = next[key];
-    next[key] = Array.isArray(current) ? appendUnique(current, incoming) : incoming;
+    next[key] = Array.isArray(current) ? mergeSessions(current, incoming) : incoming;
   }
   return JSON.stringify(next);
 }
@@ -1084,10 +1128,12 @@ function mergeLegacyChatData(
 function mergeLegacyWorkspaceChats(
   backupDbPath: string,
   localDb: DatabaseInterface,
-  allowedSessionIds: Set<string>
-): number {
+  allowedSessionIds: Set<string>,
+  updateSessionIds: Set<string>
+): { added: number; updated: number } {
   const backupDb = registry.openSync(backupDbPath, { readonly: true });
   let added = 0;
+  let updated = 0;
   try {
     for (const key of LEGACY_CHAT_DATA_KEYS) {
       const backupRow = backupDb.prepare('SELECT value FROM ItemTable WHERE key = ?').get(key) as
@@ -1099,13 +1145,25 @@ function mergeLegacyWorkspaceChats(
         | undefined;
       const backupIds = new Set<string>();
       addLegacySessionIds(backupRow.value, backupIds);
+      const localIds = new Set<string>();
+      if (localRow) addLegacySessionIds(localRow.value, localIds);
       let selected = 0;
       for (const id of backupIds) {
-        if (allowedSessionIds.has(id)) selected++;
+        if (!allowedSessionIds.has(id)) continue;
+        selected++;
+        if (localIds.has(id) && updateSessionIds.has(id)) {
+          updated++;
+        } else if (!localIds.has(id)) {
+          added++;
+        }
       }
       if (selected === 0) continue;
-      added += selected;
-      const merged = mergeLegacyChatData(localRow?.value, backupRow.value, allowedSessionIds);
+      const merged = mergeLegacyChatData(
+        localRow?.value,
+        backupRow.value,
+        allowedSessionIds,
+        updateSessionIds
+      );
       if (localRow) {
         localDb.prepare('UPDATE ItemTable SET value = ? WHERE key = ?').run(merged, key);
       } else {
@@ -1115,7 +1173,7 @@ function mergeLegacyWorkspaceChats(
   } finally {
     backupDb.close();
   }
-  return added;
+  return { added, updated };
 }
 
 /**
@@ -1128,6 +1186,7 @@ function mergeWorkspacePaneKeys(
   backupDbPath: string,
   localDb: ReturnType<typeof registry.openSync>,
   allowedSessionIds: Set<string>,
+  updateSessionIds: Set<string>,
   strict = false
 ): number {
   let paneKeysAdded = 0;
@@ -1173,9 +1232,11 @@ function mergeWorkspacePaneKeys(
           const backupValue = JSON.parse(filteredValue) as Record<string, unknown>;
           let changed = false;
           for (const [key, value] of Object.entries(backupValue)) {
+            const sessionId = key.match(/^workbench\.panel\.aichat\.view\.(.+)$/)?.[1];
             if (
               key.startsWith('workbench.panel.aichat.view.') &&
-              Object.hasOwn(localValue, key) === false
+              (Object.hasOwn(localValue, key) === false ||
+                (sessionId !== undefined && updateSessionIds.has(sessionId)))
             ) {
               localValue[key] = value;
               changed = true;
@@ -1381,6 +1442,147 @@ function readGlobalSessionIdsFromDatabase(db: DatabaseInterface, strict = false)
   return ids;
 }
 
+interface SessionVersion {
+  timestamp?: number;
+  fingerprint: string;
+}
+
+function sessionVersionFromValue(value: unknown): SessionVersion {
+  const record =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  return {
+    timestamp:
+      parseTimestampValue(record['lastUpdatedAt']) ??
+      parseTimestampValue(record['updatedAt']) ??
+      parseTimestampValue(record['lastSendTime']) ??
+      parseTimestampValue(record['createdAt']),
+    fingerprint: computeChecksum(Buffer.from(JSON.stringify(value))),
+  };
+}
+
+function readGlobalSessionVersionsFromDatabase(
+  db: DatabaseInterface,
+  strict = false
+): Map<string, SessionVersion> {
+  const versions = new Map<string, SessionVersion>();
+  try {
+    const rows = db
+      .prepare(
+        "SELECT key, value FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'"
+      )
+      .all() as Array<{ key: string; value: string }>;
+    for (const row of rows) {
+      const id = row.key.replace('composerData:', '');
+      versions.set(id, sessionVersionFromValue(JSON.parse(row.value)));
+    }
+    const hashes = new Map<string, ReturnType<typeof createHash>>();
+    for (const [id, version] of versions) {
+      hashes.set(id, createHash('sha256').update(version.fingerprint));
+      const hash = hashes.get(id)!;
+      for (const prefix of [`bubbleId:${id}:`, `checkpointId:${id}:`]) {
+        const relatedRows = db
+          .prepare('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? ORDER BY key')
+          .all(prefix, `${prefix.slice(0, -1)};`) as Array<{
+          key: string;
+          value: string;
+        }>;
+        for (const relatedRow of relatedRows) {
+          hash.update(`${relatedRow.key}\0${relatedRow.value}\0`);
+        }
+      }
+    }
+    for (const [id, hash] of hashes) {
+      const version = versions.get(id);
+      if (version) version.fingerprint = `sha256:${hash.digest('hex')}`;
+    }
+  } catch (error) {
+    if (strict) throw error;
+  }
+  return versions;
+}
+
+function readGlobalSessionVersionById(
+  db: DatabaseInterface,
+  sessionId: string
+): SessionVersion | undefined {
+  const composerKey = `composerData:${sessionId}`;
+  const composerRow = db
+    .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+    .get(composerKey) as { value: string } | undefined;
+  if (!composerRow) return undefined;
+  const version = sessionVersionFromValue(JSON.parse(composerRow.value));
+  const hash = createHash('sha256').update(version.fingerprint);
+  for (const prefix of [`bubbleId:${sessionId}:`, `checkpointId:${sessionId}:`]) {
+    const rows = db
+      .prepare('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? ORDER BY key')
+      .all(prefix, `${prefix.slice(0, -1)};`) as Array<{
+      key: string;
+      value: string;
+    }>;
+    for (const row of rows) {
+      hash.update(`${row.key}\0${row.value}\0`);
+    }
+  }
+  version.fingerprint = `sha256:${hash.digest('hex')}`;
+  return version;
+}
+
+function readWorkspaceSessionVersionsFromDatabase(
+  db: DatabaseInterface,
+  strict = false
+): Map<string, SessionVersion> {
+  const versions = new Map<string, SessionVersion>();
+  try {
+    const composerRow = db
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerData'")
+      .get() as { value: string } | undefined;
+    if (composerRow) {
+      const parsed = JSON.parse(composerRow.value) as unknown;
+      const composers = Array.isArray(parsed)
+        ? parsed
+        : parsed &&
+            typeof parsed === 'object' &&
+            Array.isArray((parsed as Record<string, unknown>)['allComposers'])
+          ? ((parsed as Record<string, unknown>)['allComposers'] as unknown[])
+          : [];
+      for (const composer of composers) {
+        if (!composer || typeof composer !== 'object') continue;
+        const id = (composer as Record<string, unknown>)['composerId'];
+        if (typeof id === 'string' && id.length > 0) {
+          versions.set(id, sessionVersionFromValue(composer));
+        }
+      }
+    }
+
+    for (const key of LEGACY_CHAT_DATA_KEYS) {
+      const row = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get(key) as
+        | { value: string }
+        | undefined;
+      if (!row) continue;
+      const parsed = JSON.parse(row.value) as unknown;
+      const containers: unknown[][] = [];
+      if (Array.isArray(parsed)) {
+        containers.push(parsed);
+      } else if (parsed && typeof parsed === 'object') {
+        const record = parsed as Record<string, unknown>;
+        if (Array.isArray(record['chatSessions'])) containers.push(record['chatSessions']);
+        if (Array.isArray(record['tabs'])) containers.push(record['tabs']);
+      }
+      for (const sessions of containers) {
+        for (const session of sessions) {
+          const id = legacySessionId(session);
+          if (id) versions.set(id, sessionVersionFromValue(session));
+        }
+      }
+    }
+  } catch (error) {
+    if (strict) throw error;
+  }
+  return versions;
+}
+
 function readGlobalReferencedSessionIdsFromDatabase(
   db: DatabaseInterface,
   strict = false
@@ -1491,7 +1693,11 @@ function readWorkspaceSessionIdsFromDatabase(db: DatabaseInterface, strict = fal
 function mergeGlobalDb(
   backupGlobalDbPath: string,
   localGlobalDbPath: string,
-  allowedSessionIds: Set<string>
+  metadataSessionIds: Set<string>,
+  rowMergeSessionIds: Set<string>,
+  updateSessionIds: Set<string>,
+  expectedLocalVersions: Map<string, SessionVersion>,
+  conflictStrategy: RestoreConflictStrategy
 ): number {
   const db = registry.openSync(localGlobalDbPath, { readonly: false });
   let attached = false;
@@ -1506,24 +1712,66 @@ function mergeGlobalDb(
 
     const localComposer = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key = ?');
     const localBubble = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1');
+    const backupComposer = db.prepare('SELECT 1 FROM backup.cursorDiskKV WHERE key = ?');
+    const backupBubble = db.prepare(
+      'SELECT 1 FROM backup.cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1'
+    );
+    const backupCheckpoint = db.prepare(
+      'SELECT 1 FROM backup.cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1'
+    );
     const insertComposer = db.prepare(
       'INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key = ?'
+    );
+    const replaceComposer = db.prepare(
+      'INSERT OR REPLACE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key = ?'
     );
     const insertRange = db.prepare(
       'INSERT OR IGNORE INTO cursorDiskKV SELECT * FROM backup.cursorDiskKV WHERE key >= ? AND key < ?'
     );
 
-    for (const sessionId of allowedSessionIds) {
+    for (const sessionId of rowMergeSessionIds) {
       const composerKey = `composerData:${sessionId}`;
       const bubbleStart = `bubbleId:${sessionId}:`;
       const bubbleEnd = `bubbleId:${sessionId};`;
-      if (localComposer.get(composerKey) || localBubble.get(bubbleStart, bubbleEnd)) {
-        throw new Error(`Session appeared after preflight: ${sessionId}`);
-      }
-      insertComposer.run(composerKey);
-      insertRange.run(bubbleStart, bubbleEnd);
+      const hasBackupComposer = Boolean(backupComposer.get(composerKey));
+      const hasBackupBubbles = Boolean(backupBubble.get(bubbleStart, bubbleEnd));
       const checkpointStart = `checkpointId:${sessionId}:`;
       const checkpointEnd = `checkpointId:${sessionId};`;
+      const hasBackupCheckpoints = Boolean(backupCheckpoint.get(checkpointStart, checkpointEnd));
+      if (!hasBackupComposer && !hasBackupBubbles && !hasBackupCheckpoints) continue;
+      if (
+        metadataSessionIds.has(sessionId) &&
+        conflictStrategy === 'newer' &&
+        updateSessionIds.has(sessionId)
+      ) {
+        const expected = expectedLocalVersions.get(sessionId);
+        const current = readGlobalSessionVersionById(db, sessionId);
+        if (expected) {
+          if (!current) {
+            throw new Error(`Session disappeared after conflict preflight: ${sessionId}`);
+          }
+          if (current.fingerprint !== expected.fingerprint) {
+            throw new Error(`Session changed after conflict preflight: ${sessionId}`);
+          }
+        } else if (current) {
+          throw new Error(`Session source appeared after conflict preflight: ${sessionId}`);
+        }
+      }
+      if (
+        metadataSessionIds.has(sessionId) &&
+        !updateSessionIds.has(sessionId) &&
+        (localComposer.get(composerKey) || localBubble.get(bubbleStart, bubbleEnd))
+      ) {
+        throw new Error(`Session appeared after preflight: ${sessionId}`);
+      }
+      if (hasBackupComposer && metadataSessionIds.has(sessionId)) {
+        if (updateSessionIds.has(sessionId)) {
+          replaceComposer.run(composerKey);
+        } else {
+          insertComposer.run(composerKey);
+        }
+      }
+      insertRange.run(bubbleStart, bubbleEnd);
       insertRange.run(checkpointStart, checkpointEnd);
     }
 
@@ -1583,7 +1831,8 @@ function initializeEmptyRestoreGlobalDb(globalDbPath: string): void {
 function mergeComposerHeaders(
   backupGlobalDbPath: string,
   localGlobalDbPath: string,
-  allowedSessionIds: Set<string>
+  allowedSessionIds: Set<string>,
+  updateSessionIds: Set<string>
 ): number {
   const localDb = registry.openSync(localGlobalDbPath, { readonly: false });
   try {
@@ -1595,7 +1844,11 @@ function mergeComposerHeaders(
       ? (JSON.parse(localRow.value) as { allComposers?: Array<Record<string, unknown>> })
       : { allComposers: [] };
     const localHeaders = localData.allComposers ?? [];
-    const localIds = new Set(localHeaders.map((h) => h['composerId'] as string).filter(Boolean));
+    const localIndexes = new Map<string, number>();
+    for (let index = 0; index < localHeaders.length; index++) {
+      const id = localHeaders[index]?.['composerId'];
+      if (typeof id === 'string') localIndexes.set(id, index);
+    }
 
     const backupDb = registry.openSync(backupGlobalDbPath, { readonly: true });
     let backupHeaders: Array<Record<string, unknown>> = [];
@@ -1614,19 +1867,24 @@ function mergeComposerHeaders(
       backupDb.close();
     }
 
-    let added = 0;
+    let changed = 0;
     for (const header of backupHeaders) {
       const id = header['composerId'] as string;
-      if (id && allowedSessionIds.has(id) && localIds.has(id) === false) {
+      if (!id || !allowedSessionIds.has(id)) continue;
+      const existingIndex = localIndexes.get(id);
+      if (existingIndex === undefined) {
         localHeaders.push(header);
-        localIds.add(id);
-        added++;
+        localIndexes.set(id, localHeaders.length - 1);
+        changed++;
+      } else if (updateSessionIds.has(id)) {
+        localHeaders[existingIndex] = header;
+        changed++;
       }
     }
 
-    if (added === 0) return 0;
+    if (changed === 0) return 0;
 
-    const merged = JSON.stringify({ allComposers: localHeaders });
+    const merged = JSON.stringify({ ...localData, allComposers: localHeaders });
     if (localRow) {
       localDb
         .prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'")
@@ -1642,7 +1900,7 @@ function mergeComposerHeaders(
     } catch {
       /* best-effort */
     }
-    return added;
+    return changed;
   } finally {
     localDb.close();
   }
@@ -2130,6 +2388,14 @@ export async function validateBackup(backupPath: string): Promise<BackupValidati
 interface RestorePlanContext {
   plan: RestorePlan;
   backupSessionIds: Set<string>;
+  sessionsToAdd: Set<string>;
+  sessionsToUpdate: Set<string>;
+  selectedSessionIds: Set<string>;
+  rowMergeSessionIds: Set<string>;
+  backupVersions: Map<string, SessionVersion>;
+  localVersions: Map<string, SessionVersion>;
+  localGlobalVersions: Map<string, SessionVersion>;
+  localWorkspaceVersions: Map<string, SessionVersion>;
 }
 
 interface FileFingerprint {
@@ -2189,12 +2455,18 @@ async function readBackupWorkspacePath(
 
 async function readBackupSessionIds(
   backupPath: string,
-  manifest: BackupManifest
-): Promise<{ ids: Set<string>; warnings: string[] }> {
+  manifest: BackupManifest,
+  includeVersions: boolean
+): Promise<{
+  ids: Set<string>;
+  versions: Map<string, SessionVersion>;
+  warnings: string[];
+}> {
   await registry.ensureDriver();
   const warnings: string[] = [];
   const globalEntry = manifest.files.find((entry) => entry.type === 'global-db');
   const globalIds = new Set<string>();
+  const versions = new Map<string, SessionVersion>();
 
   if (globalEntry) {
     const db = await openBackupDatabase(backupPath, globalEntry.path);
@@ -2202,56 +2474,69 @@ async function readBackupSessionIds(
       for (const id of readGlobalSessionIdsFromDatabase(db, true)) {
         globalIds.add(id);
       }
+      if (includeVersions) {
+        for (const [id, version] of readGlobalSessionVersionsFromDatabase(db, true)) {
+          versions.set(id, version);
+        }
+      }
     } finally {
       db.close();
     }
   }
 
-  // Filtered backups intentionally contain full workspace metadata but only a
-  // selected global session set. Manifest v1.1 records the exact set so
-  // workspace-only legacy sessions are not lost.
+  const ids = new Set(globalIds);
   if (manifest.scope?.type === 'filtered') {
     for (const id of manifest.scope.sessionIds ?? []) {
-      if (typeof id === 'string' && id.length > 0) globalIds.add(id);
+      if (typeof id === 'string' && id.length > 0) ids.add(id);
     }
     if (!manifest.scope.sessionIds) {
       warnings.push(
         'Filtered backup does not declare its exact session set; workspace-only sessions may be unavailable'
       );
     }
-    return { ids: globalIds, warnings };
-  }
-
-  // Archives created before manifest v1.1 do not declare whether they are
-  // filtered. Prefer the global set to avoid importing out-of-scope workspace
-  // metadata from an old filtered archive.
-  if (!manifest.scope && globalIds.size > 0) {
+  } else if (!manifest.scope && globalIds.size > 0) {
     warnings.push(
       'Backup scope is unknown (pre-v1.1 manifest); using global session IDs as the import set'
     );
-    return { ids: globalIds, warnings };
   }
 
-  const ids = new Set(globalIds);
+  const includeAllWorkspaceIds =
+    manifest.scope?.type === 'full' || (!manifest.scope && globalIds.size === 0);
   for (const entry of manifest.files) {
     if (entry.type !== 'workspace-db') continue;
     const db = await openBackupDatabase(backupPath, entry.path);
     try {
-      for (const id of readWorkspaceSessionIdsFromDatabase(db, true)) {
-        ids.add(id);
+      const workspaceIds = readWorkspaceSessionIdsFromDatabase(db, true);
+      if (includeAllWorkspaceIds) {
+        for (const id of workspaceIds) ids.add(id);
+      }
+      if (includeVersions) {
+        for (const [id, version] of readWorkspaceSessionVersionsFromDatabase(db, true)) {
+          if (ids.has(id) && !versions.has(id)) versions.set(id, version);
+        }
       }
     } finally {
       db.close();
     }
   }
-  return { ids, warnings };
+  return { ids, versions, warnings };
 }
 
 function readLocalSessionIds(
   localGlobalDbPath: string,
-  workspaceStorageDir: string
-): { ids: Set<string>; errors: string[] } {
+  workspaceStorageDir: string,
+  includeVersions: boolean
+): {
+  ids: Set<string>;
+  versions: Map<string, SessionVersion>;
+  globalVersions: Map<string, SessionVersion>;
+  workspaceVersions: Map<string, SessionVersion>;
+  errors: string[];
+} {
   const ids = new Set<string>();
+  const versions = new Map<string, SessionVersion>();
+  const globalVersions = new Map<string, SessionVersion>();
+  const workspaceVersions = new Map<string, SessionVersion>();
   const errors: string[] = [];
   if (existsSync(localGlobalDbPath)) {
     try {
@@ -2259,6 +2544,12 @@ function readLocalSessionIds(
       try {
         for (const id of readGlobalReferencedSessionIdsFromDatabase(db, true)) {
           ids.add(id);
+        }
+        if (includeVersions) {
+          for (const [id, version] of readGlobalSessionVersionsFromDatabase(db, true)) {
+            globalVersions.set(id, version);
+            versions.set(id, version);
+          }
         }
       } finally {
         db.close();
@@ -2270,7 +2561,9 @@ function readLocalSessionIds(
     }
   }
 
-  if (!existsSync(workspaceStorageDir)) return { ids, errors };
+  if (!existsSync(workspaceStorageDir)) {
+    return { ids, versions, globalVersions, workspaceVersions, errors };
+  }
   try {
     const entries = readdirSync(workspaceStorageDir, { withFileTypes: true });
     for (const entry of entries) {
@@ -2283,6 +2576,12 @@ function readLocalSessionIds(
           for (const id of readWorkspaceSessionIdsFromDatabase(db, true)) {
             ids.add(id);
           }
+          if (includeVersions) {
+            for (const [id, version] of readWorkspaceSessionVersionsFromDatabase(db, true)) {
+              workspaceVersions.set(id, version);
+              if (!versions.has(id)) versions.set(id, version);
+            }
+          }
         } finally {
           db.close();
         }
@@ -2293,16 +2592,18 @@ function readLocalSessionIds(
   } catch {
     // Best-effort; the target may not have workspace storage yet.
   }
-  return { ids, errors };
+  return { ids, versions, globalVersions, workspaceVersions, errors };
 }
 
-function readLocalTranscriptSessionIds(candidateIds: Set<string>): {
+function readLocalTranscriptSessionIds(
+  candidateIds: Set<string>,
+  projectsDir: string
+): {
   ids: Set<string>;
   errors: string[];
 } {
   const ids = new Set<string>();
   const errors: string[] = [];
-  const projectsDir = getCursorProjectsPath();
   if (!existsSync(projectsDir) || candidateIds.size === 0) return { ids, errors };
 
   try {
@@ -2328,10 +2629,14 @@ function readLocalTranscriptSessionIds(candidateIds: Set<string>): {
   return { ids, errors };
 }
 
-function getRestoreDestination(userDir: string, archivePath: string): string {
+function getRestoreDestination(
+  userDir: string,
+  archivePath: string,
+  projectsDir = getCursorProjectsPath()
+): string {
   const platformPath = archivePath.split('/').join(sep);
   return archivePath.startsWith('projects/')
-    ? join(homedir(), '.cursor', platformPath)
+    ? join(projectsDir, platformPath.slice(`projects${sep}`.length))
     : join(userDir, platformPath);
 }
 
@@ -2344,21 +2649,77 @@ async function buildRestorePlan(
   localWorkspaceStorageDir: string
 ): Promise<RestorePlanContext> {
   const mode: RestorePlan['mode'] = config.merge ? 'merge' : 'overwrite';
-  const backupSelection = await readBackupSessionIds(config.backupPath, manifest);
+  const requestedConflictStrategy = config.conflictStrategy ?? 'abort';
+  const validConflictStrategies: RestoreConflictStrategy[] = ['newer', 'abort', 'local', 'backup'];
+  const conflictStrategy: RestoreConflictStrategy = validConflictStrategies.includes(
+    requestedConflictStrategy as RestoreConflictStrategy
+  )
+    ? (requestedConflictStrategy as RestoreConflictStrategy)
+    : 'abort';
+  const invalidConflictStrategy = requestedConflictStrategy !== conflictStrategy;
+  const includeVersions = mode === 'merge' && conflictStrategy === 'newer';
+  const backupSelection = await readBackupSessionIds(config.backupPath, manifest, includeVersions);
   const backupSessionIds = backupSelection.ids;
-  const localSelection = readLocalSessionIds(localGlobalDbPath, localWorkspaceStorageDir);
+  const localSelection = readLocalSessionIds(
+    localGlobalDbPath,
+    localWorkspaceStorageDir,
+    includeVersions
+  );
   const localSessionIds = localSelection.ids;
-  const localTranscriptSelection = readLocalTranscriptSessionIds(backupSessionIds);
+  const projectsDir = config.projectsPath ?? getCursorProjectsPath();
+  const localTranscriptSelection = readLocalTranscriptSessionIds(backupSessionIds, projectsDir);
   for (const id of localTranscriptSelection.ids) localSessionIds.add(id);
   const conflictingSessionIds = [...backupSessionIds]
     .filter((id) => localSessionIds.has(id))
     .sort();
+  const sessionsToAdd = new Set([...backupSessionIds].filter((id) => !localSessionIds.has(id)));
+  const sessionsToUpdate = new Set<string>();
+  const sessionsToSkip = new Set<string>();
+  const unresolvedConflictIds = new Set<string>();
+
+  for (const id of conflictingSessionIds) {
+    if (conflictStrategy === 'abort') {
+      unresolvedConflictIds.add(id);
+    } else if (conflictStrategy === 'local') {
+      sessionsToSkip.add(id);
+    } else if (conflictStrategy === 'backup') {
+      sessionsToUpdate.add(id);
+    } else {
+      const backupVersion = backupSelection.versions.get(id);
+      const localVersion = localSelection.versions.get(id);
+      if (backupVersion && localVersion && backupVersion.fingerprint === localVersion.fingerprint) {
+        sessionsToSkip.add(id);
+      } else if (
+        backupVersion?.timestamp !== undefined &&
+        localVersion?.timestamp !== undefined &&
+        backupVersion.timestamp !== localVersion.timestamp
+      ) {
+        if (backupVersion.timestamp > localVersion.timestamp) {
+          sessionsToUpdate.add(id);
+        } else {
+          sessionsToSkip.add(id);
+        }
+      } else {
+        unresolvedConflictIds.add(id);
+      }
+    }
+  }
+
+  const selectedSessionIds =
+    mode === 'merge' ? new Set([...sessionsToAdd, ...sessionsToUpdate]) : new Set(backupSessionIds);
+  const rowMergeSessionIds =
+    mode === 'merge'
+      ? new Set([...sessionsToAdd, ...sessionsToUpdate, ...sessionsToSkip])
+      : new Set(backupSessionIds);
   const filesToCreate = new Set<string>();
   const filesToModify = new Set<string>();
   const filesToOverwrite = new Set<string>();
   const filesToSkip = new Set<string>();
   const warnings = [...backupSelection.warnings];
   const blockers: string[] = [];
+  if (invalidConflictStrategy) {
+    blockers.push(`Invalid conflict strategy: ${String(requestedConflictStrategy)}`);
+  }
   const archivedTranscriptSessions = new Set<string>();
   let workspacesNew = 0;
   let workspacesMerged = 0;
@@ -2374,14 +2735,12 @@ async function buildRestorePlan(
   }
   const localScanErrors = [...localSelection.errors, ...localTranscriptSelection.errors];
   if (localScanErrors.length > 0) {
-    blockers.push(
-      `Could not verify that target sessions are disjoint: ${localScanErrors.join('; ')}`
-    );
+    blockers.push(`Could not inspect target sessions safely: ${localScanErrors.join('; ')}`);
   }
 
   if (mode === 'overwrite') {
     for (const entry of manifest.files) {
-      const destination = getRestoreDestination(userDir, entry.path);
+      const destination = getRestoreDestination(userDir, entry.path, projectsDir);
       if (entry.type === 'transcript') {
         const match = entry.path.match(/^projects\/[^/]+\/agent-transcripts\/([^/]+)\//);
         if (match?.[1]) archivedTranscriptSessions.add(match[1]);
@@ -2414,9 +2773,9 @@ async function buildRestorePlan(
     if (backupSessionIds.size === 0) {
       blockers.push('No importable session IDs were found in the backup');
     }
-    if (conflictingSessionIds.length > 0) {
+    if (unresolvedConflictIds.size > 0) {
       blockers.push(
-        `Merge requires disjoint sessions, but ${conflictingSessionIds.length} session ID(s) already exist in the target`
+        `Merge has ${unresolvedConflictIds.size} unresolved overlapping session ID(s) under the '${conflictStrategy}' strategy`
       );
     }
 
@@ -2456,7 +2815,7 @@ async function buildRestorePlan(
           for (const file of manifest.files.filter((item) =>
             item.path.startsWith(`workspaceStorage/${workspaceId}/`)
           )) {
-            filesToSkip.add(getRestoreDestination(userDir, file.path));
+            filesToSkip.add(getRestoreDestination(userDir, file.path, projectsDir));
           }
           continue;
         }
@@ -2465,7 +2824,7 @@ async function buildRestorePlan(
         for (const file of manifest.files.filter((item) =>
           item.path.startsWith(`workspaceStorage/${workspaceId}/`)
         )) {
-          filesToCreate.add(getRestoreDestination(userDir, file.path));
+          filesToCreate.add(getRestoreDestination(userDir, file.path, projectsDir));
         }
       }
     } finally {
@@ -2485,14 +2844,19 @@ async function buildRestorePlan(
       if (entry.type !== 'transcript') continue;
       const match = entry.path.match(/^projects\/[^/]+\/agent-transcripts\/([^/]+)\//);
       const sessionId = match?.[1];
-      if (!sessionId || !backupSessionIds.has(sessionId)) {
-        filesToSkip.add(getRestoreDestination(userDir, entry.path));
+      if (!sessionId || !selectedSessionIds.has(sessionId)) {
+        filesToSkip.add(getRestoreDestination(userDir, entry.path, projectsDir));
         continue;
       }
-      const destination = getRestoreDestination(userDir, entry.path);
-      const destinationSessionDir = dirname(destination);
-      if (existsSync(destinationSessionDir)) {
-        filesToSkip.add(destination);
+      const destination = getRestoreDestination(userDir, entry.path, projectsDir);
+      if (existsSync(destination)) {
+        if (sessionsToUpdate.has(sessionId)) {
+          filesToModify.add(destination);
+          transcriptFilesToCopy++;
+          archivedTranscriptSessions.add(sessionId);
+        } else {
+          filesToSkip.add(destination);
+        }
       } else {
         filesToCreate.add(destination);
         if (!archivedTranscriptSessions.has(sessionId)) {
@@ -2500,6 +2864,28 @@ async function buildRestorePlan(
           transcriptFilesToCopy++;
         }
       }
+    }
+  }
+
+  if (mode === 'merge' && selectedSessionIds.size === 0) {
+    filesToCreate.clear();
+    filesToModify.clear();
+    filesToSkip.clear();
+    workspacesNew = 0;
+    workspacesMerged = 0;
+    transcriptFilesToCopy = 0;
+    const globalEntry = manifest.files.find((entry) => entry.type === 'global-db');
+    if (globalEntry && rowMergeSessionIds.size > 0) {
+      if (existsSync(localGlobalDbPath)) {
+        filesToModify.add(localGlobalDbPath);
+      } else {
+        filesToCreate.add(localGlobalDbPath);
+      }
+      warnings.push(
+        'Local session metadata wins; only missing bubble and checkpoint rows will be merged'
+      );
+    } else {
+      warnings.push('No backup sessions are selected for import under the conflict strategy');
     }
   }
 
@@ -2520,9 +2906,7 @@ async function buildRestorePlan(
   }
 
   if (manifest.files.some((entry) => entry.type === 'transcript')) {
-    warnings.push(
-      `Transcript files target ${join(homedir(), '.cursor', 'projects')} independently of --target`
-    );
+    warnings.push(`Transcript files target ${projectsDir} independently of --target`);
   }
 
   const backupScope = manifest.scope?.type ?? 'unknown';
@@ -2533,18 +2917,19 @@ async function buildRestorePlan(
   const transcriptCandidatesToSynthesize =
     config.synthesizeTranscripts === false
       ? 0
-      : [...backupSessionIds].filter((id) => !sessionsWithTranscript.has(id)).length;
+      : [...selectedSessionIds].filter((id) => !sessionsWithTranscript.has(id)).length;
   const plan: RestorePlan = {
     mode,
+    conflictStrategy,
     canApply: blockers.length === 0,
     backupScope,
     backupSessionCount: backupSessionIds.size,
     localSessionCount: localSessionIds.size,
-    sessionsToAdd:
-      mode === 'merge'
-        ? Math.max(0, backupSessionIds.size - conflictingSessionIds.length)
-        : backupSessionIds.size,
+    sessionsToAdd: mode === 'merge' ? sessionsToAdd.size : backupSessionIds.size,
+    sessionsToUpdate: mode === 'merge' ? sessionsToUpdate.size : 0,
+    sessionsToSkip: mode === 'merge' ? sessionsToSkip.size : 0,
     conflictingSessionIds,
+    unresolvedConflictIds: [...unresolvedConflictIds].sort(),
     workspacesNew,
     workspacesMerged,
     transcriptFilesToCopy,
@@ -2557,7 +2942,18 @@ async function buildRestorePlan(
     blockers,
   };
 
-  return { plan, backupSessionIds };
+  return {
+    plan,
+    backupSessionIds,
+    sessionsToAdd,
+    sessionsToUpdate,
+    selectedSessionIds,
+    rowMergeSessionIds,
+    backupVersions: backupSelection.versions,
+    localVersions: localSelection.versions,
+    localGlobalVersions: localSelection.globalVersions,
+    localWorkspaceVersions: localSelection.workspaceVersions,
+  };
 }
 
 // ============================================================================
@@ -2571,6 +2967,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
   const startTime = Date.now();
   const backupPath = config.backupPath;
   const targetPath = config.targetPath ?? getDefaultCursorDataPath();
+  const projectsPath = config.projectsPath ?? getCursorProjectsPath();
   const force = config.force ?? false;
   const merge = config.merge ?? false;
   const dryRun = config.dryRun ?? false;
@@ -2698,9 +3095,15 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
       validation,
       startTime,
       synthesizeTranscriptsEnabled,
-      planContext.backupSessionIds,
+      planContext.selectedSessionIds,
+      planContext.rowMergeSessionIds,
+      planContext.sessionsToAdd,
+      planContext.sessionsToUpdate,
+      planContext.localGlobalVersions,
+      planContext.localWorkspaceVersions,
       planContext.plan,
       backupFingerprint,
+      projectsPath,
       onProgress
     );
   }
@@ -2767,7 +3170,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
     for (let i = 0; i < manifest.files.length; i++) {
       const fileEntry = manifest.files[i]!;
       const stagedPath = join(stageDir, fileEntry.path.split('/').join(sep));
-      const destination = getRestoreDestination(userDir, fileEntry.path);
+      const destination = getRestoreDestination(userDir, fileEntry.path, projectsPath);
       const journalEntry: {
         destination: string;
         backup?: string;
@@ -2815,6 +3218,7 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
         const synthStats = await synthesizeMissingTranscripts({
           globalDbPath: localGlobalDbPath,
           workspaceStorageDir: localWorkspaceStorageDir,
+          projectsDir: projectsPath,
         });
         transcriptsSynthesized = synthStats.created;
         for (const err of synthStats.errors.slice(0, 5)) {
@@ -2891,9 +3295,15 @@ async function restoreBackupMerge(
   validation: BackupValidation,
   startTime: number,
   synthesizeTranscriptsEnabled: boolean,
-  allowedSessionIds: Set<string>,
+  selectedSessionIds: Set<string>,
+  rowMergeSessionIds: Set<string>,
+  sessionsToAdd: Set<string>,
+  sessionsToUpdate: Set<string>,
+  expectedLocalVersions: Map<string, SessionVersion>,
+  expectedWorkspaceVersions: Map<string, SessionVersion>,
   plan: RestorePlan,
   backupFingerprint: BackupFingerprint,
+  projectsPath: string,
   onProgress?: (progress: import('./types.js').RestoreProgress) => void
 ): Promise<RestoreResult> {
   const warnings: string[] = [...plan.warnings];
@@ -2915,6 +3325,7 @@ async function restoreBackupMerge(
     backup: string;
     original: FileFingerprint;
   }> = [];
+  const snapshotOriginals = new Map<string, FileFingerprint>();
   const createdTargets = new Set<string>();
   const createdDirectories = new Set<string>();
   const appliedFingerprints = new Map<string, FileFingerprint>();
@@ -2986,6 +3397,7 @@ async function restoreBackupMerge(
         throw new Error(`Target changed while preparing merge: ${target}`);
       }
       snapshots.push({ target, backup, original: beforeSnapshot });
+      snapshotOriginals.set(target, beforeSnapshot);
     }
     mutationStarted = true;
 
@@ -2994,7 +3406,7 @@ async function restoreBackupMerge(
 
     // Process each backup workspace folder
     const backupWsDir = join(tempDir, 'workspaceStorage');
-    if (existsSync(backupWsDir)) {
+    if (selectedSessionIds.size > 0 && existsSync(backupWsDir)) {
       const entries = readdirSync(backupWsDir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
@@ -3013,7 +3425,14 @@ async function restoreBackupMerge(
           const localDbPath = join(localWorkspaceStorageDir, localHash, 'state.vscdb');
           if (existsSync(localDbPath)) {
             mutationAttemptedTargets.add(localDbPath);
-            const result = mergeWorkspaceDb(backupDbPath, localDbPath, allowedSessionIds);
+            const result = mergeWorkspaceDb(
+              backupDbPath,
+              localDbPath,
+              selectedSessionIds,
+              sessionsToUpdate,
+              expectedWorkspaceVersions,
+              plan.conflictStrategy
+            );
             stats.sessionsAdded += result.added;
             stats.sessionsUpdated += result.updated;
             stats.workspacesMerged++;
@@ -3037,8 +3456,12 @@ async function restoreBackupMerge(
               createdTargets.add(dst);
               appliedFingerprints.set(dst, getFileFingerprint(dst));
             }
-            if (manifest.scope?.type !== 'full' && existsSync(join(destFolder, 'state.vscdb'))) {
-              filterWorkspaceDbToSessionIds(join(destFolder, 'state.vscdb'), allowedSessionIds);
+            if (
+              (manifest.scope?.type !== 'full' ||
+                selectedSessionIds.size !== plan.backupSessionCount) &&
+              existsSync(join(destFolder, 'state.vscdb'))
+            ) {
+              filterWorkspaceDbToSessionIds(join(destFolder, 'state.vscdb'), selectedSessionIds);
               appliedFingerprints.set(
                 join(destFolder, 'state.vscdb'),
                 getFileFingerprint(join(destFolder, 'state.vscdb'))
@@ -3065,7 +3488,11 @@ async function restoreBackupMerge(
       stats.globalRowsAdded = mergeGlobalDb(
         backupGlobalDbPath,
         localGlobalDbPath,
-        allowedSessionIds
+        selectedSessionIds,
+        rowMergeSessionIds,
+        sessionsToUpdate,
+        expectedLocalVersions,
+        plan.conflictStrategy
       );
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     } else if (existsSync(backupGlobalDbPath) && !existsSync(localGlobalDbPath)) {
@@ -3077,7 +3504,11 @@ async function restoreBackupMerge(
       stats.globalRowsAdded = mergeGlobalDb(
         backupGlobalDbPath,
         localGlobalDbPath,
-        allowedSessionIds
+        selectedSessionIds,
+        rowMergeSessionIds,
+        sessionsToUpdate,
+        expectedLocalVersions,
+        plan.conflictStrategy
       );
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     }
@@ -3088,7 +3519,8 @@ async function restoreBackupMerge(
       stats.sidebarHeadersAdded = mergeComposerHeaders(
         backupGlobalDbPath,
         localGlobalDbPath,
-        allowedSessionIds
+        selectedSessionIds,
+        sessionsToUpdate
       );
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     }
@@ -3096,7 +3528,7 @@ async function restoreBackupMerge(
     // Copy agent transcript JSONL files to ~/.cursor/projects/
     const backupProjectsDir = join(tempDir, 'projects');
     if (existsSync(backupProjectsDir)) {
-      const localProjectsDir = getCursorProjectsPath();
+      const localProjectsDir = projectsPath;
       try {
         const projEntries = readdirSync(backupProjectsDir, { withFileTypes: true });
         for (const projEntry of projEntries) {
@@ -3108,26 +3540,38 @@ async function restoreBackupMerge(
           const sessionDirs = readdirSync(backupTranscriptsDir, { withFileTypes: true });
           for (const sessionDir of sessionDirs) {
             if (sessionDir.isDirectory() === false) continue;
-            if (!allowedSessionIds.has(sessionDir.name)) continue;
+            if (!selectedSessionIds.has(sessionDir.name)) continue;
             const destSessionDir = join(localTranscriptsDir, sessionDir.name);
-            if (existsSync(destSessionDir)) {
+            const isUpdate = sessionsToUpdate.has(sessionDir.name);
+            if (existsSync(destSessionDir) && !isUpdate) {
               throw new Error(
                 `Transcript session appeared after preflight and cannot be merged safely: ${destSessionDir}`
               );
             }
 
             mkdirSync(localTranscriptsDir, { recursive: true });
-            mkdirSync(destSessionDir);
-            createdDirectories.add(destSessionDir);
+            if (!existsSync(destSessionDir)) {
+              mkdirSync(destSessionDir);
+              createdDirectories.add(destSessionDir);
+            }
             const backupFiles = readdirSync(join(backupTranscriptsDir, sessionDir.name));
             for (const f of backupFiles) {
               const destination = join(destSessionDir, f);
-              copyFileSync(
-                join(backupTranscriptsDir, sessionDir.name, f),
-                destination,
-                fsConstants.COPYFILE_EXCL
-              );
-              createdTargets.add(destination);
+              const source = join(backupTranscriptsDir, sessionDir.name, f);
+              if (existsSync(destination)) {
+                if (!isUpdate || !plan.filesToModify.includes(destination)) {
+                  throw new Error(`Transcript file appeared after preflight: ${destination}`);
+                }
+                const expected = snapshotOriginals.get(destination);
+                if (!expected || !fingerprintsEqual(expected, getFileFingerprint(destination))) {
+                  throw new Error(`Transcript file changed after preflight: ${destination}`);
+                }
+                mutationAttemptedTargets.add(destination);
+                copyFileSync(source, destination);
+              } else {
+                copyFileSync(source, destination, fsConstants.COPYFILE_EXCL);
+                createdTargets.add(destination);
+              }
               appliedFingerprints.set(destination, getFileFingerprint(destination));
             }
           }
@@ -3157,11 +3601,12 @@ async function restoreBackupMerge(
       existsSync(localGlobalDbPath)
     ) {
       try {
-        if (allowedSessionIds.size > 0) {
+        if (selectedSessionIds.size > 0) {
           const synthStats = await synthesizeMissingTranscripts({
             globalDbPath: localGlobalDbPath,
             workspaceStorageDir: localWorkspaceStorageDir,
-            sessionIds: allowedSessionIds,
+            projectsDir: projectsPath,
+            sessionIds: selectedSessionIds,
           });
           stats.transcriptsSynthesized = synthStats.created;
           for (const err of synthStats.errors.slice(0, 5)) {
@@ -3175,8 +3620,8 @@ async function restoreBackupMerge(
 
     // Preflight guarantees the selected IDs are disjoint. Report imported
     // sessions once rather than double-counting workspace and transcript work.
-    stats.sessionsAdded = allowedSessionIds.size;
-    stats.sessionsUpdated = 0;
+    stats.sessionsAdded = sessionsToAdd.size;
+    stats.sessionsUpdated = sessionsToUpdate.size;
 
     return {
       success: true,
