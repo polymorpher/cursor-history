@@ -299,6 +299,19 @@ export interface BackupManifest {
   files: BackupFileEntry[];
   /** Aggregate statistics for quick display */
   stats: BackupStats;
+  /** Backup scope (absent on archives created before manifest v1.1) */
+  scope?: BackupScope;
+}
+
+/**
+ * Whether an archive contains the full data set or a date-filtered subset.
+ */
+export interface BackupScope {
+  type: 'full' | 'filtered';
+  /** Inclusive cutoff used for a filtered backup */
+  since?: string;
+  /** Exact session import set for filtered backups */
+  sessionIds?: string[];
 }
 
 /**
@@ -387,6 +400,8 @@ export interface RestoreConfig {
   force?: boolean;
   /** Merge backup into existing data instead of overwriting */
   merge?: boolean;
+  /** Preview the restore without modifying target data */
+  dryRun?: boolean;
   /**
    * Synthesize missing agent transcript JSONL files from bubble data after
    * restore, so restored sessions are taggable/continuable (default: true)
@@ -419,18 +434,58 @@ export interface RestoreProgress {
 export interface MergeStats {
   /** Sessions added from backup */
   sessionsAdded: number;
-  /** Existing sessions updated (backup was newer) */
+  /** Existing sessions updated (always 0 for additive merge) */
   sessionsUpdated: number;
   /** New workspace folders copied */
   workspacesNew: number;
   /** Existing workspace DBs merged */
   workspacesMerged: number;
-  /** Rows added or updated in global cursorDiskKV */
+  /** Rows added to global cursorDiskKV */
   globalRowsAdded: number;
   /** Sidebar index entries added (composer.composerHeaders) */
   sidebarHeadersAdded: number;
   /** Agent transcript files synthesized from bubble data */
   transcriptsSynthesized: number;
+}
+
+/**
+ * Read-only preflight describing exactly what a restore would attempt.
+ */
+export interface RestorePlan {
+  /** Restore behavior being previewed */
+  mode: 'overwrite' | 'merge';
+  /** Whether the restore can proceed under the requested options */
+  canApply: boolean;
+  /** Scope declared by the archive manifest */
+  backupScope: 'full' | 'filtered' | 'unknown';
+  /** Sessions selected for import from the backup */
+  backupSessionCount: number;
+  /** Sessions currently present in the target */
+  localSessionCount: number;
+  /** Sessions that would be added */
+  sessionsToAdd: number;
+  /** Session IDs present in both backup and target */
+  conflictingSessionIds: string[];
+  /** New workspace folders that would be created */
+  workspacesNew: number;
+  /** Existing workspace databases that would be modified */
+  workspacesMerged: number;
+  /** Archived transcript files that would be copied */
+  transcriptFilesToCopy: number;
+  /** Missing transcript candidates that synthesis would examine */
+  transcriptCandidatesToSynthesize: number;
+  /** Destination files that would be created */
+  filesToCreate: string[];
+  /** Existing destination files that would be modified through a merge */
+  filesToModify: string[];
+  /** Existing destination files that would be replaced in overwrite mode */
+  filesToOverwrite: string[];
+  /** Archive files that would be skipped */
+  filesToSkip: string[];
+  /** Non-fatal preflight observations */
+  warnings: string[];
+  /** Conditions that prevent the requested restore */
+  blockers: string[];
 }
 
 export interface RestoreResult {
@@ -450,6 +505,10 @@ export interface RestoreResult {
   mergeStats?: MergeStats;
   /** Agent transcript files synthesized from bubble data (overwrite mode) */
   transcriptsSynthesized?: number;
+  /** Whether this result came from a read-only dry run */
+  dryRun?: boolean;
+  /** Restore preflight (returned for dry runs and blocked restores) */
+  plan?: RestorePlan;
 }
 
 /**
