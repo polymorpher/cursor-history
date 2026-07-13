@@ -509,6 +509,9 @@ export interface RestoreConfig {
   /** Target Cursor data path (default: platform-specific) */
   targetPath?: string;
 
+  /** Agent transcript projects directory (default: ~/.cursor/projects) */
+  projectsPath?: string;
+
   /** Overwrite existing data without prompting */
   force?: boolean;
 
@@ -517,6 +520,9 @@ export interface RestoreConfig {
 
   /** Preview the restore without modifying target data */
   dryRun?: boolean;
+
+  /** How overlapping session IDs are resolved during merge (default: abort) */
+  conflictStrategy?: RestoreConflictStrategy;
 
   /**
    * Synthesize missing agent transcript JSONL files from bubble data after
@@ -527,6 +533,8 @@ export interface RestoreConfig {
   /** Progress callback for UI updates */
   onProgress?: (progress: RestoreProgress) => void;
 }
+
+export type RestoreConflictStrategy = 'newer' | 'abort' | 'local' | 'backup';
 
 /**
  * Progress information during restore operation.
@@ -580,12 +588,16 @@ export interface MergeStats {
  */
 export interface RestorePlan {
   mode: 'overwrite' | 'merge';
+  conflictStrategy: RestoreConflictStrategy;
   canApply: boolean;
   backupScope: 'full' | 'filtered' | 'unknown';
   backupSessionCount: number;
   localSessionCount: number;
   sessionsToAdd: number;
+  sessionsToUpdate: number;
+  sessionsToSkip: number;
   conflictingSessionIds: string[];
+  unresolvedConflictIds: string[];
   workspacesNew: number;
   workspacesMerged: number;
   transcriptFilesToCopy: number;

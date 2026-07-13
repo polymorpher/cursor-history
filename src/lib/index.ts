@@ -34,6 +34,7 @@ export type {
   RestoreProgress,
   RestoreResult,
   RestorePlan,
+  RestoreConflictStrategy,
   MergeStats,
   BackupValidation,
   BackupInfo,

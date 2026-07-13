@@ -396,12 +396,16 @@ export interface RestoreConfig {
   backupPath: string;
   /** Target Cursor data path (default: platform-specific) */
   targetPath?: string;
+  /** Agent transcript projects directory (default: ~/.cursor/projects) */
+  projectsPath?: string;
   /** Overwrite existing data without prompting */
   force?: boolean;
   /** Merge backup into existing data instead of overwriting */
   merge?: boolean;
   /** Preview the restore without modifying target data */
   dryRun?: boolean;
+  /** How overlapping session IDs are resolved during merge (default: abort) */
+  conflictStrategy?: RestoreConflictStrategy;
   /**
    * Synthesize missing agent transcript JSONL files from bubble data after
    * restore, so restored sessions are taggable/continuable (default: true)
@@ -410,6 +414,8 @@ export interface RestoreConfig {
   /** Progress callback for UI updates */
   onProgress?: (progress: RestoreProgress) => void;
 }
+
+export type RestoreConflictStrategy = 'newer' | 'abort' | 'local' | 'backup';
 
 /**
  * Progress information during restore operation
@@ -454,6 +460,8 @@ export interface MergeStats {
 export interface RestorePlan {
   /** Restore behavior being previewed */
   mode: 'overwrite' | 'merge';
+  /** Conflict policy used for overlapping session IDs */
+  conflictStrategy: RestoreConflictStrategy;
   /** Whether the restore can proceed under the requested options */
   canApply: boolean;
   /** Scope declared by the archive manifest */
@@ -464,8 +472,14 @@ export interface RestorePlan {
   localSessionCount: number;
   /** Sessions that would be added */
   sessionsToAdd: number;
+  /** Existing sessions that would be updated from the backup */
+  sessionsToUpdate: number;
+  /** Backup sessions skipped in favor of the local version */
+  sessionsToSkip: number;
   /** Session IDs present in both backup and target */
   conflictingSessionIds: string[];
+  /** Overlaps that cannot be resolved under the selected policy */
+  unresolvedConflictIds: string[];
   /** New workspace folders that would be created */
   workspacesNew: number;
   /** Existing workspace databases that would be modified */
