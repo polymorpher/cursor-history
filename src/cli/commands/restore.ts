@@ -6,14 +6,19 @@ import type { Command } from 'commander';
 import pc from 'picocolors';
 import { existsSync } from 'node:fs';
 import { restoreBackup, validateBackup } from '../../core/backup.js';
-import type { RestoreProgress, RestoreResult } from '../../core/types.js';
+import type { RestoreConflictStrategy, RestoreProgress, RestoreResult } from '../../core/types.js';
 import { handleError, ExitCode } from '../errors.js';
 import { expandPath, contractPath } from '../../lib/platform.js';
 
 interface RestoreCommandOptions {
   target?: string;
+  projectsPath?: string;
   force?: boolean;
   merge?: boolean;
+  dryRun?: boolean;
+  autoResolveConflict?: boolean;
+  autoResolveConflicts?: boolean;
+  conflictStrategy?: string;
   synth?: boolean;
   json?: boolean;
   dataPath?: string;
@@ -67,6 +72,8 @@ function formatRestoreResultJson(result: RestoreResult): string {
       ...(result.warnings.length > 0 && { warnings: result.warnings }),
       ...(result.error && { error: result.error }),
       ...(result.mergeStats && { mergeStats: result.mergeStats }),
+      ...(result.dryRun !== undefined && { dryRun: result.dryRun }),
+      ...(result.plan && { plan: result.plan }),
       ...(result.transcriptsSynthesized !== undefined && {
         transcriptsSynthesized: result.transcriptsSynthesized,
       }),
@@ -81,6 +88,67 @@ function formatRestoreResultJson(result: RestoreResult): string {
  */
 function formatRestoreResult(result: RestoreResult): string {
   const lines: string[] = [];
+
+  if (result.dryRun && result.plan) {
+    const plan = result.plan;
+    lines.push(
+      plan.canApply
+        ? pc.green('✓ Dry run complete — restore can proceed')
+        : pc.yellow('⚠ Dry run complete — restore is blocked')
+    );
+    lines.push('');
+    lines.push(`  ${pc.bold('Mode:')} ${plan.mode}`);
+    lines.push(`  ${pc.bold('Conflict strategy:')} ${plan.conflictStrategy}`);
+    lines.push(`  ${pc.bold('Backup scope:')} ${plan.backupScope}`);
+    lines.push(`  ${pc.bold('Backup sessions:')} ${plan.backupSessionCount}`);
+    lines.push(`  ${pc.bold('Local sessions:')} ${plan.localSessionCount}`);
+    lines.push(`  ${pc.bold('Sessions to add:')} ${plan.sessionsToAdd}`);
+    lines.push(`  ${pc.bold('Sessions to update:')} ${plan.sessionsToUpdate}`);
+    lines.push(`  ${pc.bold('Sessions to skip:')} ${plan.sessionsToSkip}`);
+    lines.push(`  ${pc.bold('Conflicting sessions:')} ${plan.conflictingSessionIds.length}`);
+    lines.push(`  ${pc.bold('Unresolved conflicts:')} ${plan.unresolvedConflictIds.length}`);
+    lines.push(`  ${pc.bold('New workspaces:')} ${plan.workspacesNew}`);
+    lines.push(`  ${pc.bold('Merged workspaces:')} ${plan.workspacesMerged}`);
+    lines.push(`  ${pc.bold('Files to create:')} ${plan.filesToCreate.length}`);
+    lines.push(`  ${pc.bold('Files to modify:')} ${plan.filesToModify.length}`);
+    lines.push(`  ${pc.bold('Files to overwrite:')} ${plan.filesToOverwrite.length}`);
+    lines.push(`  ${pc.bold('Files to skip:')} ${plan.filesToSkip.length}`);
+    lines.push(`  ${pc.bold('Archived transcripts to copy:')} ${plan.transcriptFilesToCopy}`);
+    lines.push(
+      `  ${pc.bold('Transcript synthesis candidates:')} ${plan.transcriptCandidatesToSynthesize}`
+    );
+
+    if (plan.conflictingSessionIds.length > 0) {
+      lines.push('');
+      lines.push(pc.yellow('  Conflicting session IDs:'));
+      for (const id of plan.conflictingSessionIds.slice(0, 10)) {
+        lines.push(`    ${pc.dim('•')} ${id}`);
+      }
+      if (plan.conflictingSessionIds.length > 10) {
+        lines.push(`    ${pc.dim(`… and ${plan.conflictingSessionIds.length - 10} more`)}`);
+      }
+    }
+
+    if (plan.blockers.length > 0) {
+      lines.push('');
+      lines.push(pc.red('  Blockers:'));
+      for (const blocker of plan.blockers) {
+        lines.push(`    ${pc.dim('•')} ${blocker}`);
+      }
+    }
+
+    if (plan.warnings.length > 0) {
+      lines.push('');
+      lines.push(pc.yellow('  Warnings:'));
+      for (const warning of plan.warnings) {
+        lines.push(`    ${pc.dim('•')} ${warning}`);
+      }
+    }
+
+    lines.push('');
+    lines.push(pc.bold('  No target files were modified.'));
+    return lines.join('\n');
+  }
 
   if (result.success) {
     if (result.mergeStats) {
@@ -137,8 +205,16 @@ export function registerRestoreCommand(program: Command): void {
       '-t, --target <path>',
       'Target Cursor data path (default: platform-specific Cursor data directory)'
     )
+    .option(
+      '--projects-path <path>',
+      'Agent transcript projects directory (default: ~/.cursor/projects)'
+    )
     .option('-f, --force', 'Overwrite existing data without prompting')
     .option('-m, --merge', 'Merge backup into existing data instead of overwriting')
+    .option('--dry-run', 'Preview restore without modifying target data')
+    .option('--auto-resolve-conflicts', 'Resolve overlaps automatically using the newer session')
+    .option('--auto-resolve-conflict', 'Alias for --auto-resolve-conflicts')
+    .option('--conflict-strategy <strategy>', 'Overlap strategy: newer, local, backup, or abort')
     .option('--no-synth', 'Skip synthesizing missing agent transcripts after restore')
     .action(async (backupArg: string, options: RestoreCommandOptions, command: Command) => {
       const globalOptions = command.parent?.opts() as { json?: boolean; dataPath?: string };
@@ -153,6 +229,32 @@ export function registerRestoreCommand(program: Command): void {
           console.error(pc.red('Cannot use both --merge and --force.'));
           console.error(pc.dim('--merge imports missing sessions; --force overwrites everything.'));
           process.exit(ExitCode.USAGE_ERROR);
+        }
+        const autoResolveConflicts = options.autoResolveConflicts || options.autoResolveConflict;
+        if (autoResolveConflicts && options.conflictStrategy) {
+          console.error(
+            pc.red('Cannot combine --auto-resolve-conflicts with --conflict-strategy.')
+          );
+          process.exit(ExitCode.USAGE_ERROR);
+          return;
+        }
+        const validStrategies: RestoreConflictStrategy[] = ['newer', 'local', 'backup', 'abort'];
+        const conflictStrategy = autoResolveConflicts
+          ? 'newer'
+          : ((options.conflictStrategy ?? 'abort') as RestoreConflictStrategy);
+        if (!validStrategies.includes(conflictStrategy)) {
+          console.error(
+            pc.red(
+              `Invalid conflict strategy: ${options.conflictStrategy}. Expected newer, local, backup, or abort.`
+            )
+          );
+          process.exit(ExitCode.USAGE_ERROR);
+          return;
+        }
+        if (!options.merge && (autoResolveConflicts || conflictStrategy !== 'abort')) {
+          console.error(pc.red('Conflict resolution options require --merge.'));
+          process.exit(ExitCode.USAGE_ERROR);
+          return;
         }
         // T051: Check if backup file exists
         if (!existsSync(backupPath)) {
@@ -191,7 +293,7 @@ export function registerRestoreCommand(program: Command): void {
               `Warning: Backup has ${validation.corruptedFiles.length} file(s) with checksum mismatches.`
             )
           );
-          console.log(pc.dim('These files will be restored but may be corrupted.\n'));
+          console.log(pc.dim('Restore preflight will block checksum-mismatched files.\n'));
         }
 
         // Resolve target path if provided
@@ -200,6 +302,7 @@ export function registerRestoreCommand(program: Command): void {
           : customPath
             ? expandPath(customPath)
             : undefined;
+        const projectsPath = options.projectsPath ? expandPath(options.projectsPath) : undefined;
 
         // Show progress if not JSON mode
         const onProgress = useJson ? undefined : displayProgress;
@@ -208,8 +311,11 @@ export function registerRestoreCommand(program: Command): void {
         const result = await restoreBackup({
           backupPath,
           targetPath,
+          projectsPath,
           force: options.force ?? false,
           merge: options.merge ?? false,
+          dryRun: options.dryRun ?? false,
+          conflictStrategy,
           synthesizeTranscripts: options.synth ?? true,
           onProgress,
         });
@@ -221,6 +327,16 @@ export function registerRestoreCommand(program: Command): void {
 
         // Handle different error cases with appropriate exit codes
         if (!result.success) {
+          if (result.dryRun) {
+            if (useJson) {
+              console.log(formatRestoreResultJson(result));
+            } else {
+              console.error(formatRestoreResult(result));
+            }
+            process.exit(ExitCode.IO_ERROR);
+            return;
+          }
+
           // T053: Target exists without --force
           if (result.error?.includes('already has Cursor data')) {
             if (useJson) {
