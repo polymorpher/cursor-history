@@ -764,6 +764,8 @@ function readProtobufVarint(buffer: Buffer, start: number): { value: number; nex
   return null;
 }
 
+const CONVERSATION_STATE_BLOB_FIELDS = new Set([1, 3, 7, 8, 13]);
+
 export function extractConversationStateBlobHashes(composerValue: string): Set<string> {
   const hashes = new Set<string>();
   let composerData: Record<string, unknown>;
@@ -795,7 +797,7 @@ export function extractConversationStateBlobHashes(composerValue: string): Set<s
         position = length.next;
         const end = position + length.value;
         if (end > buffer.length) break;
-        if (fieldNumber === 1 && length.value === 32) {
+        if (CONVERSATION_STATE_BLOB_FIELDS.has(fieldNumber) && length.value === 32) {
           hashes.add(buffer.subarray(position, end).toString('hex'));
         }
         position = end;

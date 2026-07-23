@@ -224,12 +224,15 @@ describe('extractConversationStateBlobHashes', () => {
   it('extracts repeated 32-byte protobuf blob references', () => {
     const first = 'ab'.repeat(32);
     const second = 'cd'.repeat(32);
+    const alternateBlobField = '12'.repeat(32);
     const nonBlob = 'ef'.repeat(32);
     const state = Buffer.concat([
       Buffer.from([0x0a, 0x20]),
       Buffer.from(first, 'hex'),
       Buffer.from([0x0a, 0x20]),
       Buffer.from(second, 'hex'),
+      Buffer.from([0x42, 0x20]), // field 8: alternate blob reference set
+      Buffer.from(alternateBlobField, 'hex'),
       Buffer.from([0x7a, 0x20]), // field 15: another 32-byte payload
       Buffer.from(nonBlob, 'hex'),
     ]);
@@ -238,7 +241,7 @@ describe('extractConversationStateBlobHashes', () => {
       extractConversationStateBlobHashes(
         JSON.stringify({ conversationState: `~${state.toString('base64')}` })
       )
-    ).toEqual(new Set([first, second]));
+    ).toEqual(new Set([first, second, alternateBlobField]));
   });
 });
 
