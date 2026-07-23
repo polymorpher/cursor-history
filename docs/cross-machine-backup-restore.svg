@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620" role="img" aria-labelledby="title desc">
+  <title id="title">Cross-machine Cursor History backup and restore</title>
+  <desc id="desc">A source machine creates a portable backup ZIP. The archive can be copied and inspected without restoring. A destination machine quits Cursor, previews the restore, reviews conflicts and path mappings, then explicitly applies a merge. This is manual snapshot transfer, not live sync.</desc>
+
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity=".28"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#3fb950"/>
+    </marker>
+    <style>
+      .title { fill: #f0f6fc; font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .subtitle { fill: #8c959f; font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .step { fill: #8c959f; font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: 1.5px; }
+      .heading { fill: #f0f6fc; font: 700 21px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { fill: #c9d1d9; font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #8c959f; font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .code { fill: #f0f6fc; font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .label { fill: #c9d1d9; font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="620" rx="24" fill="url(#background)"/>
+  <text x="640" y="48" text-anchor="middle" class="title">Move Cursor context between machines - safely</text>
+  <text x="640" y="76" text-anchor="middle" class="subtitle">Create a snapshot, inspect the plan, then explicitly apply it</text>
+
+  <!-- Source machine -->
+  <g filter="url(#shadow)">
+    <rect x="45" y="112" width="350" height="374" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  </g>
+  <rect x="72" y="140" width="72" height="48" rx="7" fill="#21262d" stroke="#58a6ff" stroke-width="2"/>
+  <rect x="102" y="188" width="12" height="11" rx="2" fill="#58a6ff"/>
+  <rect x="88" y="199" width="40" height="5" rx="2.5" fill="#58a6ff"/>
+  <text x="164" y="152" class="step">01 / SOURCE</text>
+  <text x="164" y="179" class="heading">Create a snapshot</text>
+
+  <rect x="72" y="224" width="296" height="44" rx="8" fill="#21262d" stroke="#30363d"/>
+  <text x="88" y="251" class="code">cursor-history backup</text>
+
+  <circle cx="82" cy="304" r="4" fill="#58a6ff"/>
+  <text x="96" y="309" class="body">global + workspace databases</text>
+  <circle cx="82" cy="338" r="4" fill="#58a6ff"/>
+  <text x="96" y="343" class="body">workspace metadata</text>
+  <circle cx="82" cy="372" r="4" fill="#58a6ff"/>
+  <text x="96" y="377" class="body">available agent transcripts</text>
+  <circle cx="82" cy="406" r="4" fill="#58a6ff"/>
+  <text x="96" y="411" class="body">checksum manifest</text>
+
+  <rect x="72" y="440" width="296" height="27" rx="7" fill="#1f2937"/>
+  <text x="220" y="458" text-anchor="middle" class="small">quit Cursor first for the strongest snapshot</text>
+
+  <!-- Archive -->
+  <g filter="url(#shadow)">
+    <rect x="465" y="142" width="350" height="314" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  </g>
+  <path d="M499 170h45l18 18v55a8 8 0 0 1-8 8h-55a8 8 0 0 1-8-8v-65a8 8 0 0 1 8-8z" fill="#21262d" stroke="#bc8cff" stroke-width="2"/>
+  <path d="M544 170v18h18" fill="none" stroke="#bc8cff" stroke-width="2"/>
+  <rect x="512" y="188" width="12" height="7" rx="2" fill="#bc8cff"/>
+  <rect x="524" y="195" width="12" height="7" rx="2" fill="#bc8cff"/>
+  <rect x="512" y="202" width="12" height="7" rx="2" fill="#bc8cff"/>
+  <rect x="524" y="209" width="12" height="7" rx="2" fill="#bc8cff"/>
+  <text x="582" y="180" class="step">02 / PORTABLE ARCHIVE</text>
+  <text x="582" y="208" class="heading">Copy and inspect</text>
+  <text x="582" y="234" class="body">backup.zip</text>
+
+  <rect x="492" y="278" width="296" height="44" rx="8" fill="#21262d" stroke="#30363d"/>
+  <text x="508" y="305" class="code">cursor-history list -b backup.zip</text>
+  <rect x="492" y="334" width="296" height="44" rx="8" fill="#21262d" stroke="#30363d"/>
+  <text x="508" y="361" class="code">cursor-history show 1 -b backup.zip</text>
+
+  <text x="640" y="408" text-anchor="middle" class="small">read-only inspection / no restore required</text>
+  <text x="640" y="431" text-anchor="middle" class="small">archive is sensitive and unencrypted</text>
+
+  <!-- Destination machine -->
+  <g filter="url(#shadow)">
+    <rect x="885" y="102" width="350" height="394" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  </g>
+  <rect x="912" y="130" width="72" height="48" rx="7" fill="#21262d" stroke="#3fb950" stroke-width="2"/>
+  <path d="M931 155l11 11 24-27" fill="none" stroke="#3fb950" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="942" y="178" width="12" height="11" rx="2" fill="#3fb950"/>
+  <rect x="928" y="189" width="40" height="5" rx="2.5" fill="#3fb950"/>
+  <text x="1004" y="142" class="step">03 / DESTINATION</text>
+  <text x="1004" y="169" class="heading">Preflight, then restore</text>
+
+  <text x="912" y="224" class="label">1. FULLY QUIT CURSOR</text>
+  <rect x="912" y="242" width="296" height="52" rx="8" fill="#21262d" stroke="#30363d"/>
+  <text x="928" y="264" class="code">cursor-history restore backup.zip \</text>
+  <text x="928" y="282" class="code">  --merge --dry-run</text>
+
+  <text x="912" y="326" class="label">2. REVIEW</text>
+  <text x="912" y="350" class="body">integrity / conflicts / path mappings</text>
+  <text x="912" y="374" class="body">planned files / transcript actions</text>
+
+  <text x="912" y="410" class="label">3. APPLY EXPLICITLY</text>
+  <rect x="912" y="420" width="296" height="58" rx="8" fill="#173923" stroke="#3fb950"/>
+  <text x="928" y="443" class="code">cursor-history restore backup.zip \</text>
+  <text x="928" y="463" class="code">  --merge</text>
+
+  <!-- Transfer arrows -->
+  <line x1="395" y1="298" x2="449" y2="298" stroke="#58a6ff" stroke-width="3" marker-end="url(#arrow-blue)"/>
+  <text x="422" y="282" text-anchor="middle" class="label">manual copy</text>
+  <line x1="815" y1="298" x2="869" y2="298" stroke="#3fb950" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <text x="842" y="282" text-anchor="middle" class="label">reviewed plan</text>
+
+  <!-- Footer -->
+  <rect x="250" y="536" width="780" height="48" rx="12" fill="#21262d" stroke="#30363d"/>
+  <circle cx="284" cy="560" r="6" fill="#d29922"/>
+  <text x="304" y="566" class="body">manual snapshot transfer / repeat for later changes / not live or bidirectional sync</text>
+</svg>
