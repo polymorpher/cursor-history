@@ -531,7 +531,10 @@ describe('filtered backup scope', () => {
     const sourcePath = join(testRoot, 'source', 'User', 'workspaceStorage');
     mkdirSync(sourcePath, { recursive: true });
     const hash = 'ab'.repeat(32);
-    createGlobalDatabase(join(testRoot, 'source', 'User', 'globalStorage', 'state.vscdb'), [
+    const nestedHash = 'cd'.repeat(32);
+    const futureFieldHash = '56'.repeat(32);
+    const globalDbPath = join(testRoot, 'source', 'User', 'globalStorage', 'state.vscdb');
+    createGlobalDatabase(globalDbPath, [
       {
         id: 'agent-session',
         name: 'Agent Session',
@@ -539,6 +542,23 @@ describe('filtered backup scope', () => {
         agentBlobHashes: [hash],
       },
     ]);
+    const sourceDb = new Database(globalDbPath);
+    sourceDb.prepare('UPDATE cursorDiskKV SET value = ? WHERE key = ?').run(
+      Buffer.concat([
+        Buffer.from([0x0a, 0x22, 0x0a, 0x20]),
+        Buffer.from(nestedHash, 'hex'),
+        Buffer.from([0x22, 0x20]), // unknown future field 4
+        Buffer.from(futureFieldHash, 'hex'),
+      ]),
+      `agentKv:blob:${hash}`
+    );
+    sourceDb
+      .prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)')
+      .run(`agentKv:blob:${nestedHash}`, '{"nested":true}');
+    sourceDb
+      .prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)')
+      .run(`agentKv:blob:${futureFieldHash}`, '{"future":true}');
+    sourceDb.close();
     const backupPath = join(testRoot, 'agent-filtered.zip');
     const previousHome = process.env['HOME'];
     process.env['HOME'] = testRoot;
@@ -549,14 +569,26 @@ describe('filtered backup scope', () => {
         outputPath: backupPath,
         since: new Date(Date.now() - 60_000),
       });
+      const manifest = await readBackupManifest(backupPath);
       const db = await openBackupDatabase(backupPath, 'globalStorage/state.vscdb');
       const blob = db
         .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
         .get(`agentKv:blob:${hash}`);
+      const nestedBlob = db
+        .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+        .get(`agentKv:blob:${nestedHash}`);
+      const futureBlob = db
+        .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+        .get(`agentKv:blob:${futureFieldHash}`);
       db.close();
 
       expect(result.success).toBe(true);
       expect(blob).toBeDefined();
+      expect(nestedBlob).toBeDefined();
+      expect(futureBlob).toBeDefined();
+      expect(manifest?.scope?.agentBlobHashes).toEqual(
+        expect.arrayContaining([hash, nestedHash, futureFieldHash])
+      );
     } finally {
       if (previousHome === undefined) {
         delete process.env['HOME'];
@@ -1125,6 +1157,7 @@ describe('restore preflight and additive merge', () => {
     await createBackupArchive(paths.backupDbPath, paths.backupPath, {
       type: 'filtered',
       since: new Date(0).toISOString(),
+      agentBlobHashes: [],
     });
 
     const result = await restoreBackup({
@@ -1166,6 +1199,7 @@ describe('restore preflight and additive merge', () => {
         type: 'filtered',
         since: new Date(0).toISOString(),
         sessionIds: ['legacy-remote'],
+        agentBlobHashes: [],
       },
       [
         {
@@ -1209,6 +1243,7 @@ describe('restore preflight and additive merge', () => {
       type: 'filtered',
       since: new Date(0).toISOString(),
       sessionIds: ['checkpoint-session'],
+      agentBlobHashes: [],
     });
 
     const result = await restoreBackup({
@@ -1238,6 +1273,7 @@ describe('restore preflight and additive merge', () => {
       type: 'filtered',
       since: new Date(0).toISOString(),
       sessionIds: ['remote-session'],
+      agentBlobHashes: [],
     });
 
     const result = await restoreBackup({
@@ -1254,6 +1290,7 @@ describe('restore preflight and additive merge', () => {
   it('blocks restore when referenced agent context blobs are absent', async () => {
     const paths = testPaths();
     const hash = 'ef'.repeat(32);
+    const missingNestedHash = '34'.repeat(32);
     createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
     createGlobalDatabase(paths.backupDbPath, [
       {
@@ -1263,10 +1300,21 @@ describe('restore preflight and additive merge', () => {
       },
     ]);
     const sourceDb = new Database(paths.backupDbPath);
-    sourceDb.prepare('DELETE FROM cursorDiskKV WHERE key = ?').run(`agentKv:blob:${hash}`);
+    sourceDb
+      .prepare('UPDATE cursorDiskKV SET value = ? WHERE key = ?')
+      .run(
+        Buffer.concat([
+          Buffer.from([0x0a, 0x22, 0x0a, 0x20]),
+          Buffer.from(missingNestedHash, 'hex'),
+        ]),
+        `agentKv:blob:${hash}`
+      );
     sourceDb.close();
     await createBackupArchive(paths.backupDbPath, paths.backupPath, {
-      type: 'full',
+      type: 'filtered',
+      since: new Date(0).toISOString(),
+      sessionIds: ['remote-session'],
+      agentBlobHashes: [hash, missingNestedHash],
     });
 
     const result = await restoreBackup({
