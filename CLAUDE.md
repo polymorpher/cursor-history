@@ -292,11 +292,13 @@ try {
 | Command | Description |
 |---------|-------------|
 | `list` | List sessions (--all, --ids, --workspaces, -n) |
-| `show <index>` | Show session by index or composer ID (from list --ids) (-s/--short, -t/--think, -f/--fullread, -e/--error, -o/--only) |
+| `show <index>` | Show session by index or composer ID (from list --ids) (`--short`, `--think`, `--tool`, `--error`, `--only`) |
 | `search <query>` | Search across sessions (-n, --context) |
 | `export [index]` | Export to md/json (--all, -o, -f, --force) |
 | `migrate-session <session> <dest>` | Move/copy session(s) to workspace (--copy, --dry-run, -f, --debug) |
 | `migrate <source> <dest>` | Move/copy all sessions between workspaces (--copy, --dry-run, -f, --debug) |
+| `backup` | Create a full or date-filtered archive (`--since`, `--recent`, `--output`) |
+| `list-backups` | Inventory backup archives in the default or selected directory |
 | `restore <backup>` | Preview or restore a backup (`--dry-run`, `--merge`, conflict strategies, TOML/CLI workspace mappings, `--force`, `--no-synth`) |
 | `fix-transcripts` | Synthesize missing agent transcript files from chat data so sessions are taggable/continuable (--dry-run) |
 
@@ -304,7 +306,7 @@ try {
 
 - `-s, --short` - Truncate user and assistant messages to 300 characters
 - `-t, --think` - Show full AI thinking/reasoning text (default: 200 char preview)
-- `-f, --fullread` - Show full file read content (default: 100 char preview)
+- `--tool` - Expand extracted tool commands, content, results, and diffs
 - `-e, --error` - Show full error messages (default: 300 char preview)
 - `-o, --only <types>` - Filter by message types (comma-separated: user,assistant,tool,thinking,error)
 
