@@ -7,6 +7,7 @@ import pc from 'picocolors';
 import { existsSync } from 'node:fs';
 import { restoreBackup, validateBackup } from '../../core/backup.js';
 import type { RestoreConflictStrategy, RestoreProgress, RestoreResult } from '../../core/types.js';
+import { parseWorkspaceMappingArgument } from '../../core/workspace-mapping.js';
 import { handleError, ExitCode } from '../errors.js';
 import { expandPath, contractPath } from '../../lib/platform.js';
 
@@ -19,9 +20,18 @@ interface RestoreCommandOptions {
   autoResolveConflict?: boolean;
   autoResolveConflicts?: boolean;
   conflictStrategy?: string;
+  workspaceMap?: string;
+  mapPathPrefix?: string[];
+  mapWorkspace?: string[];
+  autoMapWorkspaces?: boolean;
+  mappingOutput?: string;
   synth?: boolean;
   json?: boolean;
   dataPath?: string;
+}
+
+function collectOption(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
 }
 
 /**
@@ -107,6 +117,8 @@ function formatRestoreResult(result: RestoreResult): string {
     lines.push(`  ${pc.bold('Sessions to skip:')} ${plan.sessionsToSkip}`);
     lines.push(`  ${pc.bold('Conflicting sessions:')} ${plan.conflictingSessionIds.length}`);
     lines.push(`  ${pc.bold('Unresolved conflicts:')} ${plan.unresolvedConflictIds.length}`);
+    lines.push(`  ${pc.bold('Workspace mappings:')} ${plan.workspaceMappings.length}`);
+    lines.push(`  ${pc.bold('Unmapped workspaces:')} ${plan.unmappedWorkspacePaths.length}`);
     lines.push(`  ${pc.bold('New workspaces:')} ${plan.workspacesNew}`);
     lines.push(`  ${pc.bold('Merged workspaces:')} ${plan.workspacesMerged}`);
     lines.push(`  ${pc.bold('Files to create:')} ${plan.filesToCreate.length}`);
@@ -117,6 +129,19 @@ function formatRestoreResult(result: RestoreResult): string {
     lines.push(
       `  ${pc.bold('Transcript synthesis candidates:')} ${plan.transcriptCandidatesToSynthesize}`
     );
+
+    if (plan.workspaceMappings.length > 0) {
+      lines.push('');
+      lines.push(pc.bold('  Workspace mappings:'));
+      for (const mapping of plan.workspaceMappings) {
+        lines.push(
+          `    ${pc.dim('•')} ${mapping.source} → ${mapping.target} (${mapping.confidence})`
+        );
+      }
+    }
+    if (plan.mappingOutputPath) {
+      lines.push(`  ${pc.bold('Mapping proposal:')} ${contractPath(plan.mappingOutputPath)}`);
+    }
 
     if (plan.conflictingSessionIds.length > 0) {
       lines.push('');
@@ -215,6 +240,21 @@ export function registerRestoreCommand(program: Command): void {
     .option('--auto-resolve-conflicts', 'Resolve overlaps automatically using the newer session')
     .option('--auto-resolve-conflict', 'Alias for --auto-resolve-conflicts')
     .option('--conflict-strategy <strategy>', 'Overlap strategy: newer, local, backup, or abort')
+    .option('--workspace-map <path>', 'Approved TOML workspace mapping file')
+    .option(
+      '--map-path-prefix <source=target>',
+      'Approved path-prefix mapping (repeatable)',
+      collectOption,
+      []
+    )
+    .option(
+      '--map-workspace <source=target>',
+      'Approved exact workspace mapping (repeatable)',
+      collectOption,
+      []
+    )
+    .option('--auto-map-workspaces', 'Propose workspace mappings during --dry-run')
+    .option('--mapping-output <path>', 'TOML output path for auto-mapping proposals')
     .option('--no-synth', 'Skip synthesizing missing agent transcripts after restore')
     .action(async (backupArg: string, options: RestoreCommandOptions, command: Command) => {
       const globalOptions = command.parent?.opts() as { json?: boolean; dataPath?: string };
@@ -253,6 +293,16 @@ export function registerRestoreCommand(program: Command): void {
         }
         if (!options.merge && (autoResolveConflicts || conflictStrategy !== 'abort')) {
           console.error(pc.red('Conflict resolution options require --merge.'));
+          process.exit(ExitCode.USAGE_ERROR);
+          return;
+        }
+        if (options.autoMapWorkspaces && !options.dryRun) {
+          console.error(pc.red('--auto-map-workspaces is only available with --dry-run.'));
+          process.exit(ExitCode.USAGE_ERROR);
+          return;
+        }
+        if (options.mappingOutput && !options.autoMapWorkspaces) {
+          console.error(pc.red('--mapping-output requires --auto-map-workspaces.'));
           process.exit(ExitCode.USAGE_ERROR);
           return;
         }
@@ -303,6 +353,14 @@ export function registerRestoreCommand(program: Command): void {
             ? expandPath(customPath)
             : undefined;
         const projectsPath = options.projectsPath ? expandPath(options.projectsPath) : undefined;
+        const workspaceMappingFile = options.workspaceMap
+          ? expandPath(options.workspaceMap)
+          : undefined;
+        const mappingOutputPath = options.mappingOutput
+          ? expandPath(options.mappingOutput)
+          : undefined;
+        const pathMappings = (options.mapPathPrefix ?? []).map(parseWorkspaceMappingArgument);
+        const workspaceMappings = (options.mapWorkspace ?? []).map(parseWorkspaceMappingArgument);
 
         // Show progress if not JSON mode
         const onProgress = useJson ? undefined : displayProgress;
@@ -316,6 +374,11 @@ export function registerRestoreCommand(program: Command): void {
           merge: options.merge ?? false,
           dryRun: options.dryRun ?? false,
           conflictStrategy,
+          workspaceMappingFile,
+          pathMappings,
+          workspaceMappings,
+          autoMapWorkspaces: options.autoMapWorkspaces ?? false,
+          mappingOutputPath,
           synthesizeTranscripts: options.synth ?? true,
           onProgress,
         });
