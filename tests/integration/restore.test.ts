@@ -18,12 +18,14 @@ import {
   readBackupManifest,
   restoreBackup,
 } from '../../src/core/backup.js';
+import { readWorkspaceMappingFile } from '../../src/core/workspace-mapping.js';
 import type { BackupManifest, BackupScope } from '../../src/core/types.js';
 
 interface TestSession {
   id: string;
   name: string;
   lastUpdatedAt?: number;
+  workspacePath?: string;
 }
 
 let testRoot: string;
@@ -57,12 +59,27 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
           name: session.name,
           createdAt: 1,
           lastUpdatedAt: session.lastUpdatedAt ?? 2,
+          ...(session.workspacePath && {
+            workspaceIdentifier: {
+              uri: { fsPath: session.workspacePath },
+            },
+          }),
           fullConversationHeadersOnly: [{ bubbleId, type: 1 }],
         })
       );
       insertKv.run(
         `bubbleId:${session.id}:${bubbleId}`,
-        JSON.stringify({ type: 1, text: session.name })
+        JSON.stringify({
+          type: 1,
+          text: session.name,
+          ...(session.workspacePath && {
+            toolFormerData: {
+              params: JSON.stringify({
+                targetFile: `${session.workspacePath}/file.ts`,
+              }),
+            },
+          }),
+        })
       );
     }
 
@@ -73,6 +90,11 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
           composerId: session.id,
           name: session.name,
           lastUpdatedAt: session.lastUpdatedAt ?? 2,
+          ...(session.workspacePath && {
+            workspaceIdentifier: {
+              uri: { fsPath: session.workspacePath },
+            },
+          }),
         })),
       })
     );
@@ -256,6 +278,58 @@ function readSessionName(databasePath: string, sessionId: string): string | null
   }
 }
 
+function readSessionWorkspacePath(databasePath: string, sessionId: string): string | null {
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const row = db
+      .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+      .get(`composerData:${sessionId}`) as { value: string } | undefined;
+    if (!row) return null;
+    const parsed = JSON.parse(row.value) as {
+      workspaceIdentifier?: { uri?: { fsPath?: string } };
+    };
+    return parsed.workspaceIdentifier?.uri?.fsPath ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+function readSessionBubble(databasePath: string, sessionId: string): string {
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const row = db
+      .prepare('SELECT value FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1')
+      .get(`bubbleId:${sessionId}:`, `bubbleId:${sessionId};`) as {
+      value: string;
+    };
+    return row.value;
+  } finally {
+    db.close();
+  }
+}
+
+function readSidebarHeader(
+  databasePath: string,
+  sessionId: string
+): Record<string, unknown> | null {
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const row = db
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+      .get() as { value: string } | undefined;
+    const headers = row
+      ? ((
+          JSON.parse(row.value) as {
+            allComposers?: Array<Record<string, unknown>>;
+          }
+        ).allComposers ?? [])
+      : [];
+    return headers.find((header) => header['composerId'] === sessionId) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 function updateSessionMetadata(
   databasePath: string,
   sessionId: string,
@@ -312,6 +386,57 @@ describe('filtered backup scope', () => {
         type: 'filtered',
         sessionIds: ['legacy-recent'],
       });
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env['HOME'];
+      } else {
+        process.env['HOME'] = previousHome;
+      }
+    }
+  });
+
+  it('includes workspace metadata referenced only by global composer data', async () => {
+    const sourcePath = join(testRoot, 'source', 'User', 'workspaceStorage');
+    const workspaceDir = join(sourcePath, 'modern-hash');
+    const workspacePath = join(testRoot, 'source-project');
+    mkdirSync(workspacePath, { recursive: true });
+    createWorkspaceDatabase(join(workspaceDir, 'state.vscdb'), []);
+    writeFileSync(
+      join(workspaceDir, 'workspace.json'),
+      JSON.stringify({ folder: `file://${workspacePath}` })
+    );
+    createGlobalDatabase(join(testRoot, 'source', 'User', 'globalStorage', 'state.vscdb'), [
+      {
+        id: 'modern-recent',
+        name: 'Modern Recent',
+        lastUpdatedAt: Date.now(),
+        workspacePath,
+      },
+    ]);
+    const backupPath = join(testRoot, 'modern-filtered.zip');
+    const previousHome = process.env['HOME'];
+    process.env['HOME'] = testRoot;
+
+    try {
+      const result = await createBackup({
+        sourcePath,
+        outputPath: backupPath,
+        since: new Date(Date.now() - 60_000),
+      });
+      const manifest = await readBackupManifest(backupPath);
+
+      expect(result.success).toBe(true);
+      expect(manifest?.stats.workspaceCount).toBe(1);
+      expect(manifest?.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: 'workspaceStorage/modern-hash/state.vscdb',
+          }),
+          expect.objectContaining({
+            path: 'workspaceStorage/modern-hash/workspace.json',
+          }),
+        ])
+      );
     } finally {
       if (previousHome === undefined) {
         delete process.env['HOME'];
@@ -380,6 +505,99 @@ describe('restore preflight and additive merge', () => {
     expect(result.plan?.blockers).not.toEqual(
       expect.arrayContaining([expect.stringContaining('Workspace folder collision')])
     );
+  });
+
+  it('writes an auto-mapping proposal and requires it for real restore', async () => {
+    const paths = testPaths();
+    const sourceWorkspace = '/Users/source/git/mapped-project';
+    const targetWorkspace = join(testRoot, 'agent', 'git', 'mapped-project');
+    mkdirSync(targetWorkspace, { recursive: true });
+    createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
+    createGlobalDatabase(paths.backupDbPath, [
+      {
+        id: 'remote-session',
+        name: 'Remote',
+        workspacePath: sourceWorkspace,
+      },
+    ]);
+    const sourceDb = new Database(paths.backupDbPath);
+    sourceDb
+      .prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'")
+      .run('{"allComposers":[]}');
+    sourceDb.close();
+    const localWorkspaceDir = join(paths.targetPath, 'mapped-hash');
+    createWorkspaceDatabase(join(localWorkspaceDir, 'state.vscdb'), []);
+    writeFileSync(
+      join(localWorkspaceDir, 'workspace.json'),
+      JSON.stringify({ folder: `file://${targetWorkspace}` })
+    );
+    await createBackupArchive(paths.backupDbPath, paths.backupPath, { type: 'full' }, [
+      {
+        path: 'projects/Users-source-git-mapped-project/agent-transcripts/remote-session/remote-session.jsonl',
+        content: Buffer.from('{"source":"backup"}\n'),
+        type: 'transcript',
+      },
+      {
+        path: 'projects/alternate-project/agent-transcripts/remote-session/remote-session.jsonl',
+        content: Buffer.from('{"source":"richer-backup","content":"more complete transcript"}\n'),
+        type: 'transcript',
+      },
+    ]);
+    const mappingPath = join(testRoot, 'workspace-map.toml');
+    const projectsPath = join(testRoot, 'projects');
+
+    const dryRun = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      projectsPath,
+      merge: true,
+      dryRun: true,
+      autoMapWorkspaces: true,
+      mappingOutputPath: mappingPath,
+      synthesizeTranscripts: false,
+    });
+
+    expect(dryRun.success).toBe(false);
+    expect(dryRun.plan?.mappingOutputPath).toBe(mappingPath);
+    expect(readWorkspaceMappingFile(mappingPath).workspaces).toEqual([
+      { source: sourceWorkspace, target: targetWorkspace },
+    ]);
+
+    const restore = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      projectsPath,
+      merge: true,
+      workspaceMappingFile: mappingPath,
+      synthesizeTranscripts: false,
+    });
+
+    expect(restore.success).toBe(true);
+    expect(readSessionWorkspacePath(paths.localGlobalDbPath, 'remote-session')).toBe(
+      targetWorkspace
+    );
+    expect(
+      (
+        readSidebarHeader(paths.localGlobalDbPath, 'remote-session')?.['workspaceIdentifier'] as {
+          id?: string;
+        }
+      ).id
+    ).toBe('mapped-hash');
+    expect(readSessionBubble(paths.localGlobalDbPath, 'remote-session')).toContain(
+      `${targetWorkspace}/file.ts`
+    );
+    expect(
+      readFileSync(
+        join(
+          projectsPath,
+          targetWorkspace.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, ''),
+          'agent-transcripts',
+          'remote-session',
+          'remote-session.jsonl'
+        ),
+        'utf-8'
+      )
+    ).toBe('{"source":"richer-backup","content":"more complete transcript"}\n');
   });
 
   it('imports disjoint sessions additively', async () => {
@@ -714,6 +932,15 @@ describe('restore preflight and additive merge', () => {
 
   it('imports workspace-only sessions declared by a filtered manifest', async () => {
     const paths = testPaths();
+    const sourceWorkspace = '/legacy/project';
+    const targetWorkspace = join(testRoot, 'legacy-project');
+    mkdirSync(targetWorkspace, { recursive: true });
+    const targetWorkspaceDir = join(paths.targetPath, 'legacy-target-hash');
+    createLegacyWorkspaceDatabase(join(targetWorkspaceDir, 'state.vscdb'), []);
+    writeFileSync(
+      join(targetWorkspaceDir, 'workspace.json'),
+      JSON.stringify({ folder: `file://${targetWorkspace}` })
+    );
     createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
     createGlobalDatabase(paths.backupDbPath, []);
     const legacyWorkspaceDb = join(testRoot, 'backup-source', 'legacy', 'state.vscdb');
@@ -737,7 +964,7 @@ describe('restore preflight and additive merge', () => {
         },
         {
           path: 'workspaceStorage/legacy-hash/workspace.json',
-          content: Buffer.from('{"folder":"file:///legacy/project"}'),
+          content: Buffer.from(JSON.stringify({ folder: `file://${sourceWorkspace}` })),
           type: 'workspace-json',
         },
       ]
@@ -747,13 +974,14 @@ describe('restore preflight and additive merge', () => {
       backupPath: paths.backupPath,
       targetPath: paths.targetPath,
       merge: true,
+      workspaceMappings: [{ source: sourceWorkspace, target: targetWorkspace }],
       synthesizeTranscripts: false,
     });
 
     expect(result.success).toBe(true);
     expect(result.mergeStats?.sessionsAdded).toBe(1);
     expect(
-      readLegacyWorkspaceSessionIds(join(paths.targetPath, 'legacy-hash', 'state.vscdb'))
+      readLegacyWorkspaceSessionIds(join(paths.targetPath, 'legacy-target-hash', 'state.vscdb'))
     ).toEqual(['legacy-remote']);
   });
 
@@ -786,6 +1014,30 @@ describe('restore preflight and additive merge', () => {
 
     expect(result.success).toBe(true);
     expect(checkpoint).toBeDefined();
+  });
+
+  it('synthesizes headers when a filtered global DB has no ItemTable', async () => {
+    const paths = testPaths();
+    createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
+    createGlobalDatabase(paths.backupDbPath, [{ id: 'remote-session', name: 'Remote' }]);
+    const sourceDb = new Database(paths.backupDbPath);
+    sourceDb.exec('DROP TABLE ItemTable');
+    sourceDb.close();
+    await createBackupArchive(paths.backupDbPath, paths.backupPath, {
+      type: 'filtered',
+      since: new Date(0).toISOString(),
+      sessionIds: ['remote-session'],
+    });
+
+    const result = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      merge: true,
+      synthesizeTranscripts: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(readSidebarHeader(paths.localGlobalDbPath, 'remote-session')?.['name']).toBe('Remote');
   });
 
   it('dry-runs overwrite mode without replacing an existing database', async () => {

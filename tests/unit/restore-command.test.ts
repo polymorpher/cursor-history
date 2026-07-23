@@ -64,6 +64,8 @@ describe('restore command dry run', () => {
         sessionsToSkip: 0,
         conflictingSessionIds: [],
         unresolvedConflictIds: [],
+        workspaceMappings: [],
+        unmappedWorkspacePaths: [],
         workspacesNew: 0,
         workspacesMerged: 0,
         transcriptFilesToCopy: 0,
@@ -146,6 +148,34 @@ describe('restore command dry run', () => {
       expect.objectContaining({
         merge: true,
         conflictStrategy: 'local',
+      })
+    );
+  });
+
+  it('passes TOML and CLI workspace mappings', async () => {
+    const program = new Command();
+    program.option('--json');
+    registerRestoreCommand(program);
+
+    await program.parseAsync([
+      'node',
+      'test',
+      'restore',
+      '/backup.zip',
+      '--merge',
+      '--workspace-map',
+      '/mapping.toml',
+      '--map-path-prefix',
+      '/Users/source=/Users/target',
+      '--map-workspace',
+      '/source/project=/target/project',
+    ]);
+
+    expect(mockRestoreBackup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceMappingFile: '/mapping.toml',
+        pathMappings: [{ source: '/Users/source', target: '/Users/target' }],
+        workspaceMappings: [{ source: '/source/project', target: '/target/project' }],
       })
     );
   });
