@@ -1,5 +1,16 @@
 # Cursor History Message Data Structure Analysis Report
 
+> [!CAUTION]
+> **Historical research snapshot, not current product documentation.** This
+> report describes one local data sample from February 2026. Cursor's private
+> schema has changed since then, and conclusions about branching, timestamps,
+> table availability, and workspace attribution should not be generalized to
+> current Cursor 3 data. See the
+> [README](https://github.com/polymorpher/cursor-history/blob/main/README.md)
+> for supported behavior. The current library exposes stored bubble IDs and
+> Cursor's active-branch bubble list when available, but it still cannot
+> reconstruct a complete parent-linked branch tree from this historical sample.
+
 **Date:** 2026-02-12
 **Analyst:** Claude Opus 4.5
 **Purpose:** Investigate how Cursor stores chat history, specifically whether it supports conversation forking/branching like Claude Code

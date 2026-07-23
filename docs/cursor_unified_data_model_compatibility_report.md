@@ -1,5 +1,15 @@
 # 统一 Data Model 兼容性分析报告
 
+> [!CAUTION]
+> **历史研究快照，不是当前产品文档。** 本报告只描述 2026 年 2 月的一组本机
+> 数据样本。此后 Cursor 的私有存储结构已经变化；其中关于时间戳 fallback、
+> workspace 可靠性、全局存储结构和分支信息的结论不能直接用于当前 Cursor 3。
+> 请以最新
+> [README](https://github.com/polymorpher/cursor-history/blob/main/README.md)
+> 和代码测试为准。当前实现已经修复报告中的时间戳 fallback 问题，并支持
+> global-only session、`.code-workspace`、workspace fallback 以及可用时的
+> active-branch bubble ID。
+
 > **日期**: 2026-02-13
 > **验证方式**: 直接查询本机 Cursor SQLite 数据库
 > **数据源**: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
