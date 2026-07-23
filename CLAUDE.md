@@ -387,6 +387,7 @@ Edit `extractBubbleText()` in `src/core/storage.ts`. Priority matters:
   - Cross-user path changes support repeatable CLI prefix/exact mappings and approved TOML mapping files
   - `--dry-run --auto-map-workspaces` proposes mappings and writes TOML; real restores never auto-apply proposals
   - Approved mappings rewrite composer/header workspace identifiers, workspace-rooted bubble paths, workspace metadata, and transcript project slugs
+  - Restore populates both legacy `composer.composerHeaders` JSON and Cursor 3.11's dedicated `composerHeaders` table, bumping the version key so the sidebar reloads imported sessions
 - Transcript synthesis: restored sessions are now taggable/continuable in Cursor
   - Cursor 3.x only lists a chat in the @-mention "past chats" menu (and resumes it with the unified agent backend) when a transcript exists at `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`; restored sessions had DB data but no transcript file
   - New `src/core/transcript.ts`: `synthesizeTranscript()` rebuilds the JSONL from bubble data (user text wrapped in `<user_query>`, assistant text + `tool_use` blocks), `synthesizeMissingTranscripts()` scans sessions listed in `composer.composerHeaders`, resolves each session's workspace (header `workspaceIdentifier` → composerData → workspace pane keys) and writes missing transcripts
