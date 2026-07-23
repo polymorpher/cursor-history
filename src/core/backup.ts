@@ -765,6 +765,17 @@ function readProtobufVarint(buffer: Buffer, start: number): { value: number; nex
 }
 
 const CONVERSATION_STATE_BLOB_FIELDS = new Set([1, 3, 7, 8, 13]);
+const NESTED_AGENT_BLOB_PATHS = new Set([
+  '1',
+  '1.1',
+  '1.2',
+  '2.8.2.1.10',
+  '3',
+  '8',
+  '10',
+  '15.2.1',
+  '15.2.2',
+]);
 
 export function extractConversationStateBlobHashes(composerValue: string): Set<string> {
   const hashes = new Set<string>();
@@ -813,6 +824,85 @@ export function extractConversationStateBlobHashes(composerValue: string): Set<s
   return hashes;
 }
 
+function extractNestedAgentBlobCandidates(value: unknown): Array<{ path: string; hash: string }> {
+  const candidates: Array<{ path: string; hash: string }> = [];
+  const buffer = Buffer.isBuffer(value)
+    ? value
+    : value instanceof Uint8Array
+      ? Buffer.from(value)
+      : Buffer.from(String(value));
+
+  const scan = (data: Buffer, parentPath: string, depth: number): void => {
+    if (depth > 6) return;
+    let position = 0;
+    while (position < data.length) {
+      const tag = readProtobufVarint(data, position);
+      if (!tag) return;
+      position = tag.next;
+      const fieldNumber = Math.floor(tag.value / 8);
+      const wireType = tag.value & 0x7;
+      if (wireType === 0) {
+        const varint = readProtobufVarint(data, position);
+        if (!varint) return;
+        position = varint.next;
+      } else if (wireType === 1) {
+        position += 8;
+      } else if (wireType === 2) {
+        const length = readProtobufVarint(data, position);
+        if (!length) return;
+        position = length.next;
+        const end = position + length.value;
+        if (end > data.length) return;
+        const child = data.subarray(position, end);
+        const path = parentPath ? `${parentPath}.${fieldNumber}` : String(fieldNumber);
+        if (length.value === 32) {
+          candidates.push({ path, hash: child.toString('hex') });
+        } else if (length.value > 0) {
+          scan(child, path, depth + 1);
+        }
+        position = end;
+      } else if (wireType === 5) {
+        position += 4;
+      } else {
+        return;
+      }
+    }
+  };
+  scan(buffer, '', 0);
+  return candidates;
+}
+
+function collectAgentBlobClosure(
+  db: DatabaseInterface,
+  composerValue: string,
+  tableName = 'cursorDiskKV'
+): Map<string, unknown> {
+  const rows = new Map<string, unknown>();
+  const pending = [...extractConversationStateBlobHashes(composerValue)];
+  const seen = new Set<string>();
+  const getBlob = db.prepare(`SELECT value FROM ${tableName} WHERE key = ?`);
+  while (pending.length > 0) {
+    const hash = pending.shift()!;
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    const key = `agentKv:blob:${hash}`;
+    const row = getBlob.get(key) as { value: unknown } | undefined;
+    if (!row) {
+      continue;
+    }
+    rows.set(key, row.value);
+    for (const candidate of extractNestedAgentBlobCandidates(row.value)) {
+      if (
+        NESTED_AGENT_BLOB_PATHS.has(candidate.path) ||
+        getBlob.get(`agentKv:blob:${candidate.hash}`)
+      ) {
+        if (!seen.has(candidate.hash)) pending.push(candidate.hash);
+      }
+    }
+  }
+  return rows;
+}
+
 /**
  * Create a filtered copy of the global database containing only rows for
  * the given session IDs. Much smaller than a full copy for incremental backups.
@@ -821,10 +911,11 @@ async function createFilteredGlobalDb(
   sourceDbPath: string,
   sessionIds: Set<string>,
   destPath: string
-): Promise<void> {
+): Promise<Set<string>> {
   await registry.ensureDriver();
   const sourceDb = registry.openSync(sourceDbPath, { readonly: true });
   const destDb = registry.openSync(destPath, { readonly: false });
+  const includedAgentBlobHashes = new Set<string>();
 
   try {
     destDb.runSQL(
@@ -851,13 +942,10 @@ async function createFilteredGlobalDb(
       if (composer) {
         insertStmt.run(composer.key, composer.value);
         if (typeof composer.value === 'string') {
-          for (const hash of extractConversationStateBlobHashes(composer.value)) {
-            const blobKey = `agentKv:blob:${hash}`;
-            const blob = selectComposer.get(blobKey) as { key: string; value: unknown } | undefined;
-            if (!blob) {
-              throw new Error(`Session ${id} references missing agent blob ${hash}`);
-            }
-            insertStmt.run(blob.key, blob.value);
+          const closure = collectAgentBlobClosure(sourceDb, composer.value);
+          for (const [blobKey, blobValue] of closure) {
+            insertStmt.run(blobKey, blobValue);
+            includedAgentBlobHashes.add(blobKey.slice('agentKv:blob:'.length));
           }
         }
       }
@@ -961,6 +1049,7 @@ async function createFilteredGlobalDb(
     destDb.close();
     sourceDb.close();
   }
+  return includedAgentBlobHashes;
 }
 
 // ============================================================================
@@ -2291,7 +2380,8 @@ function mergeGlobalDb(
   rowMergeSessionIds: Set<string>,
   updateSessionIds: Set<string>,
   expectedLocalVersions: Map<string, SessionVersion>,
-  conflictStrategy: RestoreConflictStrategy
+  conflictStrategy: RestoreConflictStrategy,
+  manifestAgentBlobHashes: Set<string>
 ): number {
   const db = registry.openSync(localGlobalDbPath, { readonly: false });
   let attached = false;
@@ -2368,13 +2458,8 @@ function mergeGlobalDb(
       }
       const composerRow = backupValueByKey.get(composerKey) as { value: unknown } | undefined;
       if (typeof composerRow?.value === 'string') {
-        for (const hash of extractConversationStateBlobHashes(composerRow.value)) {
-          const blobKey = `agentKv:blob:${hash}`;
-          if (!backupValueByKey.get(blobKey)) {
-            throw new Error(
-              `Backup is missing agent blob ${hash} required by session ${sessionId}`
-            );
-          }
+        const closure = collectAgentBlobClosure(db, composerRow.value, 'backup.cursorDiskKV');
+        for (const blobKey of closure.keys()) {
           insertComposer.run(blobKey);
         }
       }
@@ -2387,6 +2472,13 @@ function mergeGlobalDb(
       ]) {
         insertRange.run(prefix, `${prefix.slice(0, -1)};`);
       }
+    }
+    for (const hash of manifestAgentBlobHashes) {
+      const blobKey = `agentKv:blob:${hash}`;
+      if (!backupValueByKey.get(blobKey)) {
+        throw new Error(`Backup blob manifest references missing blob ${hash}`);
+      }
+      insertComposer.run(blobKey);
     }
 
     db.runSQL('COMMIT');
@@ -2755,6 +2847,7 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
     let bytesCompleted = 0;
     let sessionCount = 0;
     const workspaceIds = new Set<string>();
+    const includedAgentBlobHashes = new Set<string>();
 
     for (let i = 0; i < dbFiles.length; i++) {
       const dbFile = dbFiles[i]!;
@@ -2775,7 +2868,8 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       // For SQLite databases, use backup API; for other files, just copy
       if (dbFile.type === 'global-db' && filteredIds) {
         // Date-filtered: create partial global DB with only matching sessions
-        await createFilteredGlobalDb(dbFile.absolutePath, filteredIds, tempFilePath);
+        const hashes = await createFilteredGlobalDb(dbFile.absolutePath, filteredIds, tempFilePath);
+        for (const hash of hashes) includedAgentBlobHashes.add(hash);
       } else if (dbFile.type === 'global-db' || dbFile.type === 'workspace-db') {
         // T011: Backup database using SQLite backup API
         await backupDatabase(dbFile.absolutePath, tempFilePath);
@@ -2815,6 +2909,13 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       bytesCompleted: totalBytes,
       totalBytes,
     });
+
+    if (backupScope.type === 'filtered') {
+      backupScope = {
+        ...backupScope,
+        agentBlobHashes: [...includedAgentBlobHashes].sort(),
+      };
+    }
 
     // T014: Create zip file using streaming (supports files > 2GB via ZIP64)
     const manifest = createManifest(
@@ -3199,6 +3300,7 @@ async function readBackupSessionIds(
   versions: Map<string, SessionVersion>;
   workspacePaths: Map<string, string>;
   missingAgentBlobs: Array<{ sessionId: string; hash: string }>;
+  agentBlobManifestMissing: boolean;
   warnings: string[];
 }> {
   await registry.ensureDriver();
@@ -3208,6 +3310,8 @@ async function readBackupSessionIds(
   const versions = new Map<string, SessionVersion>();
   const workspacePaths = new Map<string, string>();
   const missingAgentBlobs: Array<{ sessionId: string; hash: string }> = [];
+  const agentBlobManifestMissing =
+    manifest.scope?.type === 'filtered' && manifest.scope.agentBlobHashes === undefined;
 
   if (globalEntry) {
     const db = await openBackupDatabase(backupPath, globalEntry.path);
@@ -3223,14 +3327,11 @@ async function readBackupSessionIds(
       for (const [id, path] of readGlobalSessionWorkspacePathsFromDatabase(db, true)) {
         workspacePaths.set(id, path);
       }
-      const getComposer = db.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
-      const hasBlob = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key = ?');
-      for (const id of globalIds) {
-        const row = getComposer.get(`composerData:${id}`) as { value: string } | undefined;
-        if (!row) continue;
-        for (const hash of extractConversationStateBlobHashes(row.value)) {
+      if (manifest.scope?.agentBlobHashes) {
+        const hasBlob = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key = ?');
+        for (const hash of manifest.scope.agentBlobHashes) {
           if (!hasBlob.get(`agentKv:blob:${hash}`)) {
-            missingAgentBlobs.push({ sessionId: id, hash });
+            missingAgentBlobs.push({ sessionId: 'manifest', hash });
           }
         }
       }
@@ -3291,7 +3392,14 @@ async function readBackupSessionIds(
   } finally {
     workspaceZip?.close();
   }
-  return { ids, versions, workspacePaths, missingAgentBlobs, warnings };
+  return {
+    ids,
+    versions,
+    workspacePaths,
+    missingAgentBlobs,
+    agentBlobManifestMissing,
+    warnings,
+  };
 }
 
 function readLocalSessionIds(
@@ -3618,6 +3726,11 @@ async function buildRestorePlan(
     );
     warnings.push(
       `First missing blob: ${backupSelection.missingAgentBlobs[0]!.hash} (session ${backupSelection.missingAgentBlobs[0]!.sessionId})`
+    );
+  }
+  if (backupSelection.agentBlobManifestMissing) {
+    blockers.push(
+      'Filtered backup does not include an agent blob closure manifest; create a new backup before restore'
     );
   }
   const unregisteredMappingTargets = mappingProposals
@@ -4506,7 +4619,8 @@ async function restoreBackupMerge(
         rowMergeSessionIds,
         sessionsToUpdate,
         expectedLocalVersions,
-        plan.conflictStrategy
+        plan.conflictStrategy,
+        new Set(manifest.scope?.agentBlobHashes ?? [])
       );
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     } else if (existsSync(backupGlobalDbPath) && !existsSync(localGlobalDbPath)) {
@@ -4522,7 +4636,8 @@ async function restoreBackupMerge(
         rowMergeSessionIds,
         sessionsToUpdate,
         expectedLocalVersions,
-        plan.conflictStrategy
+        plan.conflictStrategy,
+        new Set(manifest.scope?.agentBlobHashes ?? [])
       );
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     }
