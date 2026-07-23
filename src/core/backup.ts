@@ -751,6 +751,66 @@ function readWorkspacePaneSessionIds(dbPath: string): string[] {
   }
 }
 
+function readProtobufVarint(buffer: Buffer, start: number): { value: number; next: number } | null {
+  let value = 0;
+  let shift = 0;
+  let position = start;
+  while (position < buffer.length && shift <= 49) {
+    const byte = buffer[position++]!;
+    value += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return { value, next: position };
+    shift += 7;
+  }
+  return null;
+}
+
+export function extractConversationStateBlobHashes(composerValue: string): Set<string> {
+  const hashes = new Set<string>();
+  let composerData: Record<string, unknown>;
+  try {
+    composerData = JSON.parse(composerValue) as Record<string, unknown>;
+  } catch {
+    return hashes;
+  }
+  const state = composerData['conversationState'];
+  if (typeof state !== 'string' || state.length === 0) return hashes;
+  try {
+    const buffer = Buffer.from(state.replace(/^~/, ''), 'base64');
+    let position = 0;
+    while (position < buffer.length) {
+      const tag = readProtobufVarint(buffer, position);
+      if (!tag) break;
+      position = tag.next;
+      const wireType = tag.value & 0x7;
+      const fieldNumber = Math.floor(tag.value / 8);
+      if (wireType === 0) {
+        const value = readProtobufVarint(buffer, position);
+        if (!value) break;
+        position = value.next;
+      } else if (wireType === 1) {
+        position += 8;
+      } else if (wireType === 2) {
+        const length = readProtobufVarint(buffer, position);
+        if (!length) break;
+        position = length.next;
+        const end = position + length.value;
+        if (end > buffer.length) break;
+        if (fieldNumber === 1 && length.value === 32) {
+          hashes.add(buffer.subarray(position, end).toString('hex'));
+        }
+        position = end;
+      } else if (wireType === 5) {
+        position += 4;
+      } else {
+        break;
+      }
+    }
+  } catch {
+    // Preserve compatibility with sessions that use a different state format.
+  }
+  return hashes;
+}
+
 /**
  * Create a filtered copy of the global database containing only rows for
  * the given session IDs. Much smaller than a full copy for incremental backups.
@@ -784,15 +844,36 @@ async function createFilteredGlobalDb(
     destDb.runSQL('BEGIN');
     for (const id of sessionIds) {
       const composer = selectComposer.get(`composerData:${id}`) as
-        | { key: string; value: string }
+        | { key: string; value: unknown }
         | undefined;
       if (composer) {
         insertStmt.run(composer.key, composer.value);
+        if (typeof composer.value === 'string') {
+          for (const hash of extractConversationStateBlobHashes(composer.value)) {
+            const blobKey = `agentKv:blob:${hash}`;
+            const blob = selectComposer.get(blobKey) as { key: string; value: unknown } | undefined;
+            if (!blob) {
+              throw new Error(`Session ${id} references missing agent blob ${hash}`);
+            }
+            insertStmt.run(blob.key, blob.value);
+          }
+        }
       }
-      for (const prefix of [`bubbleId:${id}:`, `checkpointId:${id}:`]) {
+      const virtualHeights = selectComposer.get(`composerVirtualRowHeights:${id}`) as
+        | { key: string; value: unknown }
+        | undefined;
+      if (virtualHeights) {
+        insertStmt.run(virtualHeights.key, virtualHeights.value);
+      }
+      for (const prefix of [
+        `bubbleId:${id}:`,
+        `checkpointId:${id}:`,
+        `messageRequestContext:${id}:`,
+        `ofsContent:${id}:`,
+      ]) {
         const rows = selectRange.all(prefix, `${prefix.slice(0, -1)};`) as Array<{
           key: string;
-          value: string;
+          value: unknown;
         }>;
         for (const row of rows) {
           insertStmt.run(row.key, row.value);
@@ -1897,6 +1978,10 @@ function composerDataToHeader(
     'isSpec',
     'isProject',
     'isBestOfNSubcomposer',
+    'isBestOfNParent',
+    'subagentInfo',
+    'subComposerIds',
+    'subagentComposerIds',
     'numSubComposers',
     'referencedPlans',
     'trackedGitRepos',
@@ -1923,6 +2008,18 @@ function ensureComposerHeadersTable(db: DatabaseInterface): void {
   );
 }
 
+function isSubagentRecord(value: Record<string, unknown>, composerId: string): boolean {
+  const subagentInfo =
+    value['subagentInfo'] && typeof value['subagentInfo'] === 'object'
+      ? (value['subagentInfo'] as Record<string, unknown>)
+      : undefined;
+  return (
+    value['isBestOfNSubcomposer'] === true ||
+    composerId.startsWith('task-') ||
+    typeof subagentInfo?.['parentComposerId'] === 'string'
+  );
+}
+
 function composerHeaderTableValues(header: Record<string, unknown>): {
   composerId: string;
   workspaceId: string | null;
@@ -1944,14 +2041,7 @@ function composerHeaderTableValues(header: Record<string, unknown>): {
   const createdAt = parseTimestampValue(header['createdAt']) ?? null;
   const lastUpdatedAt = parseTimestampValue(header['lastUpdatedAt']) ?? null;
   const checkpointAt = parseTimestampValue(header['conversationCheckpointLastUpdatedAt']) ?? null;
-  const subagentInfo =
-    header['subagentInfo'] && typeof header['subagentInfo'] === 'object'
-      ? (header['subagentInfo'] as Record<string, unknown>)
-      : undefined;
-  const isSubagent =
-    header['isBestOfNSubcomposer'] === true ||
-    composerId.startsWith('task-') ||
-    typeof subagentInfo?.['parentComposerId'] === 'string';
+  const isSubagent = isSubagentRecord(header, composerId);
   return {
     composerId,
     workspaceId,
@@ -1979,6 +2069,10 @@ function applyWorkspaceMappingsToBackupGlobalDb(
     const getByKey = db.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
     const updateByKey = db.prepare('UPDATE cursorDiskKV SET value = ? WHERE key = ?');
     const getRange = db.prepare('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?');
+    const insertByKey = db.prepare(
+      'INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)'
+    );
+    const deleteByKey = db.prepare('DELETE FROM cursorDiskKV WHERE key = ?');
     const composerDataById = new Map<string, Record<string, unknown>>();
 
     for (const sessionId of metadataSessionIds) {
@@ -1997,7 +2091,11 @@ function applyWorkspaceMappingsToBackupGlobalDb(
     }
 
     for (const sessionId of rowSessionIds) {
-      for (const prefix of [`bubbleId:${sessionId}:`, `checkpointId:${sessionId}:`]) {
+      for (const prefix of [
+        `bubbleId:${sessionId}:`,
+        `checkpointId:${sessionId}:`,
+        `messageRequestContext:${sessionId}:`,
+      ]) {
         const rows = getRange.all(prefix, `${prefix.slice(0, -1)};`) as Array<{
           key: string;
           value: string;
@@ -2014,6 +2112,32 @@ function applyWorkspaceMappingsToBackupGlobalDb(
           }
         }
       }
+      const heightsKey = `composerVirtualRowHeights:${sessionId}`;
+      const heightsRow = getByKey.get(heightsKey) as { value: string } | undefined;
+      if (heightsRow) {
+        try {
+          const value = rewriteJsonRowValue(heightsRow.value, mapper);
+          if (value) {
+            updateByKey.run(value, heightsKey);
+            changed++;
+          }
+        } catch {
+          // Preserve non-JSON values.
+        }
+      }
+      const ofsPrefix = `ofsContent:${sessionId}:`;
+      const ofsRows = getRange.all(ofsPrefix, `${ofsPrefix.slice(0, -1)};`) as Array<{
+        key: string;
+        value: unknown;
+      }>;
+      for (const row of ofsRows) {
+        const suffix = row.key.slice(ofsPrefix.length);
+        const mappedSuffix = mapper.rewriteString(suffix);
+        if (mappedSuffix === suffix) continue;
+        insertByKey.run(`${ofsPrefix}${mappedSuffix}`, row.value);
+        deleteByKey.run(row.key);
+        changed++;
+      }
     }
 
     db.runSQL('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)');
@@ -2028,16 +2152,26 @@ function applyWorkspaceMappingsToBackupGlobalDb(
       : { allComposers: [] };
     let headersChanged = false;
     const existingIds = new Set<string>();
-    const allComposers = (parsed.allComposers ?? []).map((header) => {
+    const allComposers: Array<Record<string, unknown>> = [];
+    const modernHeaders: Array<Record<string, unknown>> = [];
+    for (const header of parsed.allComposers ?? []) {
       const id = header['composerId'];
       if (typeof id === 'string') existingIds.add(id);
-      if (typeof id !== 'string' || !metadataSessionIds.has(id)) return header;
+      if (typeof id !== 'string' || !metadataSessionIds.has(id)) {
+        allComposers.push(header);
+        continue;
+      }
       const rewritten = rewriteMappedPaths(header, mapper);
       const rewrittenHeader = rewritten.value as Record<string, unknown>;
       const workspaceIdChanged = updateWorkspaceIdentifierId(rewrittenHeader, targetWorkspaceIds);
       headersChanged ||= rewritten.changed || workspaceIdChanged;
-      return rewrittenHeader;
-    });
+      modernHeaders.push(rewrittenHeader);
+      if (composerHeaderTableValues(rewrittenHeader)?.isSubagent === 1) {
+        headersChanged = true;
+      } else {
+        allComposers.push(rewrittenHeader);
+      }
+    }
     for (const sessionId of metadataSessionIds) {
       if (existingIds.has(sessionId)) continue;
       const composerData =
@@ -2049,7 +2183,10 @@ function applyWorkspaceMappingsToBackupGlobalDb(
       if (!composerData) continue;
       const header = composerDataToHeader(sessionId, composerData);
       updateWorkspaceIdentifierId(header, targetWorkspaceIds);
-      allComposers.push(header);
+      modernHeaders.push(header);
+      if (composerHeaderTableValues(header)?.isSubagent !== 1) {
+        allComposers.push(header);
+      }
       existingIds.add(sessionId);
       headersChanged = true;
     }
@@ -2072,7 +2209,7 @@ function applyWorkspaceMappingsToBackupGlobalDb(
         '(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
         'isSubagent, recency, checkpointAt, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
-    for (const header of allComposers) {
+    for (const header of modernHeaders) {
       const id = header['composerId'];
       if (typeof id !== 'string' || !metadataSessionIds.has(id)) continue;
       const values = composerHeaderTableValues(header);
@@ -2168,6 +2305,7 @@ function mergeGlobalDb(
     const localComposer = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key = ?');
     const localBubble = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1');
     const backupComposer = db.prepare('SELECT 1 FROM backup.cursorDiskKV WHERE key = ?');
+    const backupValueByKey = db.prepare('SELECT value FROM backup.cursorDiskKV WHERE key = ?');
     const backupBubble = db.prepare(
       'SELECT 1 FROM backup.cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1'
     );
@@ -2226,8 +2364,27 @@ function mergeGlobalDb(
           insertComposer.run(composerKey);
         }
       }
-      insertRange.run(bubbleStart, bubbleEnd);
-      insertRange.run(checkpointStart, checkpointEnd);
+      const composerRow = backupValueByKey.get(composerKey) as { value: unknown } | undefined;
+      if (typeof composerRow?.value === 'string') {
+        for (const hash of extractConversationStateBlobHashes(composerRow.value)) {
+          const blobKey = `agentKv:blob:${hash}`;
+          if (!backupValueByKey.get(blobKey)) {
+            throw new Error(
+              `Backup is missing agent blob ${hash} required by session ${sessionId}`
+            );
+          }
+          insertComposer.run(blobKey);
+        }
+      }
+      insertComposer.run(`composerVirtualRowHeights:${sessionId}`);
+      for (const prefix of [
+        bubbleStart,
+        checkpointStart,
+        `messageRequestContext:${sessionId}:`,
+        `ofsContent:${sessionId}:`,
+      ]) {
+        insertRange.run(prefix, `${prefix.slice(0, -1)};`);
+      }
     }
 
     db.runSQL('COMMIT');
@@ -2298,7 +2455,20 @@ function mergeComposerHeaders(
     const localData = localRow
       ? (JSON.parse(localRow.value) as { allComposers?: Array<Record<string, unknown>> })
       : { allComposers: [] };
-    const localHeaders = localData.allComposers ?? [];
+    const getLocalComposer = localDb.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
+    const originalLocalHeaders = localData.allComposers ?? [];
+    const localHeaders = originalLocalHeaders.filter((header) => {
+      const id = header['composerId'];
+      if (typeof id !== 'string') return true;
+      if (isSubagentRecord(header, id)) return false;
+      const row = getLocalComposer.get(`composerData:${id}`) as { value: string } | undefined;
+      if (!row) return true;
+      try {
+        return !isSubagentRecord(JSON.parse(row.value) as Record<string, unknown>, id);
+      } catch {
+        return true;
+      }
+    });
     const localIndexes = new Map<string, number>();
     for (let index = 0; index < localHeaders.length; index++) {
       const id = localHeaders[index]?.['composerId'];
@@ -2307,6 +2477,7 @@ function mergeComposerHeaders(
 
     const backupDb = registry.openSync(backupGlobalDbPath, { readonly: true });
     let backupHeaders: Array<Record<string, unknown>> = [];
+    let modernBackupHeaders: Array<Record<string, unknown>> = [];
     try {
       const backupRow = backupDb
         .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
@@ -2318,11 +2489,26 @@ function mergeComposerHeaders(
         };
         backupHeaders = backupData.allComposers ?? [];
       }
+      const hasModernTable = backupDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'composerHeaders'")
+        .get();
+      if (hasModernTable) {
+        const rows = backupDb.prepare('SELECT value FROM composerHeaders').all() as Array<{
+          value: string;
+        }>;
+        modernBackupHeaders = rows.flatMap((row) => {
+          try {
+            return [JSON.parse(row.value) as Record<string, unknown>];
+          } catch {
+            return [];
+          }
+        });
+      }
     } finally {
       backupDb.close();
     }
 
-    let changed = 0;
+    let changed = originalLocalHeaders.length - localHeaders.length;
     for (const header of backupHeaders) {
       const id = header['composerId'] as string;
       if (!id || !allowedSessionIds.has(id)) continue;
@@ -2379,7 +2565,7 @@ function mergeComposerHeaders(
       );
       tableChanged += Number(result.changes);
     }
-    for (const header of backupHeaders) {
+    for (const header of modernBackupHeaders) {
       const id = header['composerId'];
       if (typeof id !== 'string' || !allowedSessionIds.has(id)) continue;
       const values = composerHeaderTableValues(header);
@@ -3010,6 +3196,7 @@ async function readBackupSessionIds(
   ids: Set<string>;
   versions: Map<string, SessionVersion>;
   workspacePaths: Map<string, string>;
+  missingAgentBlobs: Array<{ sessionId: string; hash: string }>;
   warnings: string[];
 }> {
   await registry.ensureDriver();
@@ -3018,6 +3205,7 @@ async function readBackupSessionIds(
   const globalIds = new Set<string>();
   const versions = new Map<string, SessionVersion>();
   const workspacePaths = new Map<string, string>();
+  const missingAgentBlobs: Array<{ sessionId: string; hash: string }> = [];
 
   if (globalEntry) {
     const db = await openBackupDatabase(backupPath, globalEntry.path);
@@ -3032,6 +3220,17 @@ async function readBackupSessionIds(
       }
       for (const [id, path] of readGlobalSessionWorkspacePathsFromDatabase(db, true)) {
         workspacePaths.set(id, path);
+      }
+      const getComposer = db.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
+      const hasBlob = db.prepare('SELECT 1 FROM cursorDiskKV WHERE key = ?');
+      for (const id of globalIds) {
+        const row = getComposer.get(`composerData:${id}`) as { value: string } | undefined;
+        if (!row) continue;
+        for (const hash of extractConversationStateBlobHashes(row.value)) {
+          if (!hasBlob.get(`agentKv:blob:${hash}`)) {
+            missingAgentBlobs.push({ sessionId: id, hash });
+          }
+        }
       }
     } finally {
       db.close();
@@ -3090,7 +3289,7 @@ async function readBackupSessionIds(
   } finally {
     workspaceZip?.close();
   }
-  return { ids, versions, workspacePaths, warnings };
+  return { ids, versions, workspacePaths, missingAgentBlobs, warnings };
 }
 
 function readLocalSessionIds(
@@ -3411,6 +3610,14 @@ async function buildRestorePlan(
       `Backup has ${validation.corruptedFiles.length} checksum-mismatched file(s); restore will not proceed`
     );
   }
+  if (backupSelection.missingAgentBlobs.length > 0) {
+    blockers.push(
+      `Backup is missing ${backupSelection.missingAgentBlobs.length} agent context blob(s); create a new backup before restore`
+    );
+    warnings.push(
+      `First missing blob: ${backupSelection.missingAgentBlobs[0]!.hash} (session ${backupSelection.missingAgentBlobs[0]!.sessionId})`
+    );
+  }
   const unregisteredMappingTargets = mappingProposals
     .filter(
       (proposal) => ![...localPathMap.keys()].some((path) => pathsEqual(path, proposal.target))
@@ -3680,6 +3887,7 @@ async function buildRestorePlan(
     workspacesMerged,
     transcriptFilesToCopy,
     transcriptCandidatesToSynthesize,
+    missingAgentBlobCount: backupSelection.missingAgentBlobs.length,
     filesToCreate: [...filesToCreate].sort(),
     filesToModify: [...filesToModify].sort(),
     filesToOverwrite: [...filesToOverwrite].sort(),
