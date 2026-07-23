@@ -406,6 +406,16 @@ export interface RestoreConfig {
   dryRun?: boolean;
   /** How overlapping session IDs are resolved during merge (default: abort) */
   conflictStrategy?: RestoreConflictStrategy;
+  /** TOML file containing approved workspace/path mappings */
+  workspaceMappingFile?: string;
+  /** Approved source-to-target path prefix mappings */
+  pathMappings?: WorkspacePathMapping[];
+  /** Approved exact source-to-target workspace mappings */
+  workspaceMappings?: WorkspacePathMapping[];
+  /** Propose workspace mappings during a dry run */
+  autoMapWorkspaces?: boolean;
+  /** TOML destination for generated dry-run mapping proposals */
+  mappingOutputPath?: string;
   /**
    * Synthesize missing agent transcript JSONL files from bubble data after
    * restore, so restored sessions are taggable/continuable (default: true)
@@ -416,6 +426,19 @@ export interface RestoreConfig {
 }
 
 export type RestoreConflictStrategy = 'newer' | 'abort' | 'local' | 'backup';
+
+export interface WorkspacePathMapping {
+  source: string;
+  target: string;
+}
+
+export type WorkspaceMappingConfidence = 'exact' | 'high' | 'medium' | 'explicit';
+
+export interface WorkspaceMappingProposal extends WorkspacePathMapping {
+  confidence: WorkspaceMappingConfidence;
+  reason: string;
+  sessionIds: string[];
+}
 
 /**
  * Progress information during restore operation
@@ -440,7 +463,7 @@ export interface RestoreProgress {
 export interface MergeStats {
   /** Sessions added from backup */
   sessionsAdded: number;
-  /** Existing sessions updated (always 0 for additive merge) */
+  /** Existing sessions updated from the backup */
   sessionsUpdated: number;
   /** New workspace folders copied */
   workspacesNew: number;
@@ -480,6 +503,12 @@ export interface RestorePlan {
   conflictingSessionIds: string[];
   /** Overlaps that cannot be resolved under the selected policy */
   unresolvedConflictIds: string[];
+  /** Approved or automatically proposed workspace path mappings */
+  workspaceMappings: WorkspaceMappingProposal[];
+  /** Source workspace paths that still require an approved mapping */
+  unmappedWorkspacePaths: string[];
+  /** TOML proposal file written by this dry run */
+  mappingOutputPath?: string;
   /** New workspace folders that would be created */
   workspacesNew: number;
   /** Existing workspace databases that would be modified */
