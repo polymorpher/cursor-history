@@ -25,7 +25,7 @@ import {
   constants as fsConstants,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join, dirname, sep } from 'node:path';
+import { basename, join, dirname, sep } from 'node:path';
 import yazl from 'yazl';
 import yauzl from 'yauzl';
 
@@ -146,13 +146,26 @@ import type {
   RestoreResult,
   RestorePlan,
   RestoreConflictStrategy,
+  WorkspacePathMapping,
   MergeStats,
   BackupValidation,
   BackupInfo,
 } from './types.js';
 import { readWorkspaceJson } from './storage.js';
-import { normalizePath } from '../lib/platform.js';
-import { synthesizeMissingTranscripts, workspacePathToProjectSlug } from './transcript.js';
+import { normalizePath, pathsEqual } from '../lib/platform.js';
+import {
+  synthesizeMissingTranscripts,
+  workspaceIdentifierToPath,
+  workspacePathToProjectSlug,
+} from './transcript.js';
+import {
+  WorkspacePathMapper,
+  proposeWorkspaceMappings,
+  readWorkspaceMappingFile,
+  rewriteMappedPaths,
+  writeWorkspaceMappingFile,
+  type WorkspaceMappingConfigData,
+} from './workspace-mapping.js';
 
 // Package version for manifest
 const CURSOR_HISTORY_VERSION = '0.9.2';
@@ -652,6 +665,27 @@ function getFilteredSessionIds(dataPath: string, since: Date): Set<string> {
   return ids;
 }
 
+function getFilteredSessionWorkspacePaths(dataPath: string, sessionIds: Set<string>): Set<string> {
+  const paths = new Set<string>();
+  const globalDbPath = join(dataPath, '..', 'globalStorage', 'state.vscdb');
+  if (!existsSync(globalDbPath)) return paths;
+  try {
+    const db = registry.openSync(globalDbPath, { readonly: true });
+    try {
+      const sessionPaths = readGlobalSessionWorkspacePathsFromDatabase(db);
+      for (const id of sessionIds) {
+        const path = sessionPaths.get(id);
+        if (path) paths.add(normalizePath(path));
+      }
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Best-effort; pane-key matching remains available.
+  }
+  return paths;
+}
+
 /**
  * Check whether a workspace DB has any session updated on or after `since`,
  * or contains pane-key references to any of the already-filtered session IDs.
@@ -735,6 +769,8 @@ async function createFilteredGlobalDb(
       'CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT NOT NULL, value TEXT NOT NULL)'
     );
     destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS cursorDiskKV_key ON cursorDiskKV(key)');
+    destDb.runSQL('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)');
+    destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS ItemTable_key ON ItemTable(key)');
 
     const insertStmt = destDb.prepare(
       'INSERT OR IGNORE INTO cursorDiskKV (key, value) VALUES (?, ?)'
@@ -782,10 +818,6 @@ async function createFilteredGlobalDb(
         );
 
         if (filtered.length > 0) {
-          destDb.runSQL(
-            'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)'
-          );
-          destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS ItemTable_key ON ItemTable(key)');
           destDb
             .prepare(
               "INSERT OR IGNORE INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)"
@@ -1523,6 +1555,58 @@ function readGlobalSessionVersionsFromDatabase(
   return versions;
 }
 
+function workspacePathFromComposerData(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const fromIdentifier = workspaceIdentifierToPath(
+    record['workspaceIdentifier'] as Parameters<typeof workspaceIdentifierToPath>[0]
+  );
+  if (fromIdentifier) return workspaceUriToFsPath(fromIdentifier);
+  const workspaceUri = record['workspaceUri'];
+  return typeof workspaceUri === 'string' ? workspaceUriToFsPath(workspaceUri) : null;
+}
+
+function readGlobalSessionWorkspacePathsFromDatabase(
+  db: DatabaseInterface,
+  strict = false
+): Map<string, string> {
+  const paths = new Map<string, string>();
+  try {
+    const rows = db
+      .prepare(
+        "SELECT key, value FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'"
+      )
+      .all() as Array<{ key: string; value: string }>;
+    for (const row of rows) {
+      const id = row.key.replace('composerData:', '');
+      const path = workspacePathFromComposerData(JSON.parse(row.value));
+      if (path) paths.set(id, normalizePath(path));
+    }
+    const hasItemTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ItemTable'")
+      .get();
+    const headersRow = hasItemTable
+      ? (db.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'").get() as
+          | { value: string }
+          | undefined)
+      : undefined;
+    if (headersRow) {
+      const parsed = JSON.parse(headersRow.value) as {
+        allComposers?: Array<Record<string, unknown>>;
+      };
+      for (const header of parsed.allComposers ?? []) {
+        const id = header['composerId'];
+        if (typeof id !== 'string' || paths.has(id)) continue;
+        const path = workspacePathFromComposerData(header);
+        if (path) paths.set(id, normalizePath(path));
+      }
+    }
+  } catch (error) {
+    if (strict) throw error;
+  }
+  return paths;
+}
+
 function readGlobalSessionVersionById(
   db: DatabaseInterface,
   sessionId: string
@@ -1620,9 +1704,14 @@ function readGlobalReferencedSessionIdsFromDatabase(
       }
     }
 
-    const headersRow = db
-      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
-      .get() as { value: string } | undefined;
+    const hasItemTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ItemTable'")
+      .get();
+    const headersRow = hasItemTable
+      ? (db.prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'").get() as
+          | { value: string }
+          | undefined)
+      : undefined;
     if (headersRow) {
       const parsed = JSON.parse(headersRow.value) as {
         allComposers?: Array<{ composerId?: string }>;
@@ -1699,6 +1788,232 @@ function readWorkspaceSessionIdsFromDatabase(db: DatabaseInterface, strict = fal
     if (strict) throw error;
   }
   return ids;
+}
+
+function rewriteJsonRowValue(value: string, mapper: WorkspacePathMapper): string | null {
+  const parsed = JSON.parse(value) as unknown;
+  const rewritten = rewriteMappedPaths(parsed, mapper);
+  return rewritten.changed ? JSON.stringify(rewritten.value) : null;
+}
+
+function updateWorkspaceIdentifierId(
+  value: unknown,
+  targetWorkspaceIds: Map<string, string>
+): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const workspacePath = workspacePathFromComposerData(record);
+  if (!workspacePath) return false;
+  const workspaceId = targetWorkspaceIds.get(normalizePath(workspacePath));
+  if (!workspaceId) return false;
+  const identifier =
+    record['workspaceIdentifier'] &&
+    typeof record['workspaceIdentifier'] === 'object' &&
+    !Array.isArray(record['workspaceIdentifier'])
+      ? (record['workspaceIdentifier'] as Record<string, unknown>)
+      : {};
+  if (identifier['id'] === workspaceId) return false;
+  record['workspaceIdentifier'] = { ...identifier, id: workspaceId };
+  return true;
+}
+
+function composerDataToHeader(
+  sessionId: string,
+  composerData: Record<string, unknown>
+): Record<string, unknown> {
+  const headers = Array.isArray(composerData['fullConversationHeadersOnly'])
+    ? (composerData['fullConversationHeadersOnly'] as Array<Record<string, unknown>>)
+    : [];
+  const headerTimes = headers
+    .map((header) => parseTimestampValue(header['createdAt']))
+    .filter((timestamp): timestamp is number => timestamp !== undefined);
+  const createdAt =
+    parseTimestampValue(composerData['createdAt']) ??
+    (headerTimes.length > 0 ? Math.min(...headerTimes) : Date.now());
+  const lastUpdatedAt =
+    parseTimestampValue(composerData['lastUpdatedAt']) ??
+    parseTimestampValue(composerData['conversationCheckpointLastUpdatedAt']) ??
+    (headerTimes.length > 0 ? Math.max(...headerTimes) : createdAt);
+  const fields = [
+    'name',
+    'unifiedMode',
+    'forceMode',
+    'hasUnreadMessages',
+    'contextUsagePercent',
+    'totalLinesAdded',
+    'totalLinesRemoved',
+    'filesChangedCount',
+    'subtitle',
+    'isArchived',
+    'isDraft',
+    'isWorktree',
+    'worktreeStartedReadOnly',
+    'isSpec',
+    'isProject',
+    'isBestOfNSubcomposer',
+    'numSubComposers',
+    'referencedPlans',
+    'trackedGitRepos',
+    'workspaceIdentifier',
+  ] as const;
+  const header: Record<string, unknown> = {
+    type: 'head',
+    composerId: sessionId,
+    createdAt,
+    lastUpdatedAt,
+  };
+  for (const field of fields) {
+    if (composerData[field] !== undefined) header[field] = composerData[field];
+  }
+  return header;
+}
+
+function applyWorkspaceMappingsToBackupGlobalDb(
+  globalDbPath: string,
+  metadataSessionIds: Set<string>,
+  rowSessionIds: Set<string>,
+  mapper: WorkspacePathMapper,
+  targetWorkspaceIds: Map<string, string>
+): number {
+  const db = registry.openSync(globalDbPath, { readonly: false });
+  let changed = 0;
+  try {
+    db.runSQL('BEGIN');
+    const getByKey = db.prepare('SELECT value FROM cursorDiskKV WHERE key = ?');
+    const updateByKey = db.prepare('UPDATE cursorDiskKV SET value = ? WHERE key = ?');
+    const getRange = db.prepare('SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?');
+    const composerDataById = new Map<string, Record<string, unknown>>();
+
+    for (const sessionId of metadataSessionIds) {
+      const key = `composerData:${sessionId}`;
+      const row = getByKey.get(key) as { value: string } | undefined;
+      if (!row) continue;
+      const composerData = JSON.parse(row.value) as Record<string, unknown>;
+      const rewritten = rewriteMappedPaths(composerData, mapper);
+      const rewrittenData = rewritten.value as Record<string, unknown>;
+      const workspaceIdChanged = updateWorkspaceIdentifierId(rewrittenData, targetWorkspaceIds);
+      composerDataById.set(sessionId, rewrittenData);
+      if (rewritten.changed || workspaceIdChanged) {
+        updateByKey.run(JSON.stringify(rewrittenData), key);
+        changed++;
+      }
+    }
+
+    for (const sessionId of rowSessionIds) {
+      for (const prefix of [`bubbleId:${sessionId}:`, `checkpointId:${sessionId}:`]) {
+        const rows = getRange.all(prefix, `${prefix.slice(0, -1)};`) as Array<{
+          key: string;
+          value: string;
+        }>;
+        for (const row of rows) {
+          try {
+            const value = rewriteJsonRowValue(row.value, mapper);
+            if (value) {
+              updateByKey.run(value, row.key);
+              changed++;
+            }
+          } catch {
+            // Preserve non-JSON rows.
+          }
+        }
+      }
+    }
+
+    db.runSQL('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)');
+    db.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS ItemTable_key ON ItemTable(key)');
+    const headersRow = db
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+      .get() as { value: string } | undefined;
+    const parsed = headersRow
+      ? (JSON.parse(headersRow.value) as {
+          allComposers?: Array<Record<string, unknown>>;
+        })
+      : { allComposers: [] };
+    let headersChanged = false;
+    const existingIds = new Set<string>();
+    const allComposers = (parsed.allComposers ?? []).map((header) => {
+      const id = header['composerId'];
+      if (typeof id === 'string') existingIds.add(id);
+      if (typeof id !== 'string' || !metadataSessionIds.has(id)) return header;
+      const rewritten = rewriteMappedPaths(header, mapper);
+      const rewrittenHeader = rewritten.value as Record<string, unknown>;
+      const workspaceIdChanged = updateWorkspaceIdentifierId(rewrittenHeader, targetWorkspaceIds);
+      headersChanged ||= rewritten.changed || workspaceIdChanged;
+      return rewrittenHeader;
+    });
+    for (const sessionId of metadataSessionIds) {
+      if (existingIds.has(sessionId)) continue;
+      const composerData =
+        composerDataById.get(sessionId) ??
+        (() => {
+          const row = getByKey.get(`composerData:${sessionId}`) as { value: string } | undefined;
+          return row ? (JSON.parse(row.value) as Record<string, unknown>) : undefined;
+        })();
+      if (!composerData) continue;
+      const header = composerDataToHeader(sessionId, composerData);
+      updateWorkspaceIdentifierId(header, targetWorkspaceIds);
+      allComposers.push(header);
+      existingIds.add(sessionId);
+      headersChanged = true;
+    }
+    if (headersChanged) {
+      if (headersRow) {
+        db.prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'").run(
+          JSON.stringify({ ...parsed, allComposers })
+        );
+      } else {
+        db.prepare('INSERT INTO ItemTable (key, value) VALUES (?, ?)').run(
+          'composer.composerHeaders',
+          JSON.stringify({ ...parsed, allComposers })
+        );
+      }
+      changed++;
+    }
+    db.runSQL('COMMIT');
+    return changed;
+  } catch (error) {
+    try {
+      db.runSQL('ROLLBACK');
+    } catch {
+      // Preserve the original error.
+    }
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+function applyWorkspaceMappingsToBackupWorkspaceDb(
+  workspaceDbPath: string,
+  mapper: WorkspacePathMapper
+): number {
+  const db = registry.openSync(workspaceDbPath, { readonly: false });
+  let changed = 0;
+  try {
+    db.runSQL('BEGIN');
+    for (const key of ['composer.composerData', ...LEGACY_CHAT_DATA_KEYS]) {
+      const row = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get(key) as
+        | { value: string }
+        | undefined;
+      if (!row) continue;
+      const value = rewriteJsonRowValue(row.value, mapper);
+      if (value) {
+        db.prepare('UPDATE ItemTable SET value = ? WHERE key = ?').run(value, key);
+        changed++;
+      }
+    }
+    db.runSQL('COMMIT');
+    return changed;
+  } catch (error) {
+    try {
+      db.runSQL('ROLLBACK');
+    } catch {
+      // Preserve the original error.
+    }
+    throw error;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -2018,10 +2333,15 @@ export async function createBackup(config?: BackupConfig): Promise<BackupResult>
       since: since.toISOString(),
       sessionIds: [...filteredIds].sort(),
     };
+    const filteredWorkspacePaths = getFilteredSessionWorkspacePaths(sourcePath, filteredIds);
     // Determine which workspace DBs to include
     for (const file of allDbFiles) {
       if (file.type === 'workspace-db' && file.workspaceId) {
-        if (shouldIncludeWorkspace(file.absolutePath, since, filteredIds)) {
+        const workspacePath = readWorkspaceJson(dirname(file.absolutePath));
+        if (
+          shouldIncludeWorkspace(file.absolutePath, since, filteredIds) ||
+          (workspacePath && filteredWorkspacePaths.has(normalizePath(workspacePath)))
+        ) {
           includedWorkspaceIds.add(file.workspaceId);
         }
       }
@@ -2413,9 +2733,37 @@ interface RestorePlanContext {
   selectedSessionIds: Set<string>;
   rowMergeSessionIds: Set<string>;
   backupVersions: Map<string, SessionVersion>;
+  backupWorkspacePaths: Map<string, string>;
+  mappedWorkspacePaths: Map<string, string>;
+  mappingConfig: WorkspaceMappingConfigData;
+  targetWorkspaceIds: Map<string, string>;
   localVersions: Map<string, SessionVersion>;
   localGlobalVersions: Map<string, SessionVersion>;
   localWorkspaceVersions: Map<string, SessionVersion>;
+}
+
+function mergeWorkspaceMappings(
+  base: WorkspacePathMapping[],
+  overrides: WorkspacePathMapping[]
+): WorkspacePathMapping[] {
+  const merged = new Map<string, WorkspacePathMapping>();
+  for (const mapping of [...base, ...overrides]) {
+    merged.set(normalizePath(mapping.source), {
+      source: normalizePath(mapping.source),
+      target: normalizePath(mapping.target),
+    });
+  }
+  return [...merged.values()];
+}
+
+function loadWorkspaceMappingConfig(config: RestoreConfig): WorkspaceMappingConfigData {
+  const fromFile = config.workspaceMappingFile
+    ? readWorkspaceMappingFile(config.workspaceMappingFile)
+    : { pathPrefixes: [], workspaces: [] };
+  return {
+    pathPrefixes: mergeWorkspaceMappings(fromFile.pathPrefixes, config.pathMappings ?? []),
+    workspaces: mergeWorkspaceMappings(fromFile.workspaces, config.workspaceMappings ?? []),
+  };
 }
 
 interface FileFingerprint {
@@ -2480,6 +2828,7 @@ async function readBackupSessionIds(
 ): Promise<{
   ids: Set<string>;
   versions: Map<string, SessionVersion>;
+  workspacePaths: Map<string, string>;
   warnings: string[];
 }> {
   await registry.ensureDriver();
@@ -2487,6 +2836,7 @@ async function readBackupSessionIds(
   const globalEntry = manifest.files.find((entry) => entry.type === 'global-db');
   const globalIds = new Set<string>();
   const versions = new Map<string, SessionVersion>();
+  const workspacePaths = new Map<string, string>();
 
   if (globalEntry) {
     const db = await openBackupDatabase(backupPath, globalEntry.path);
@@ -2498,6 +2848,9 @@ async function readBackupSessionIds(
         for (const [id, version] of readGlobalSessionVersionsFromDatabase(db, true)) {
           versions.set(id, version);
         }
+      }
+      for (const [id, path] of readGlobalSessionWorkspacePathsFromDatabase(db, true)) {
+        workspacePaths.set(id, path);
       }
     } finally {
       db.close();
@@ -2522,24 +2875,41 @@ async function readBackupSessionIds(
 
   const includeAllWorkspaceIds =
     manifest.scope?.type === 'full' || (!manifest.scope && globalIds.size === 0);
-  for (const entry of manifest.files) {
-    if (entry.type !== 'workspace-db') continue;
-    const db = await openBackupDatabase(backupPath, entry.path);
-    try {
-      const workspaceIds = readWorkspaceSessionIdsFromDatabase(db, true);
-      if (includeAllWorkspaceIds) {
-        for (const id of workspaceIds) ids.add(id);
-      }
-      if (includeVersions) {
-        for (const [id, version] of readWorkspaceSessionVersionsFromDatabase(db, true)) {
-          if (ids.has(id) && !versions.has(id)) versions.set(id, version);
+  const workspaceEntries = manifest.files.filter((entry) => entry.type === 'workspace-db');
+  const workspaceZip = workspaceEntries.length > 0 ? await ZipReader.open(backupPath) : null;
+  try {
+    for (const entry of workspaceEntries) {
+      const workspaceId = entry.path.match(/^workspaceStorage\/([^/]+)\/state\.vscdb$/)?.[1];
+      const workspacePath =
+        workspaceId && workspaceZip
+          ? await readBackupWorkspacePath(workspaceZip, workspaceId)
+          : null;
+      const db = await openBackupDatabase(backupPath, entry.path);
+      try {
+        const workspaceIds = readWorkspaceSessionIdsFromDatabase(db, true);
+        if (includeAllWorkspaceIds) {
+          for (const id of workspaceIds) ids.add(id);
         }
+        if (workspacePath) {
+          for (const id of workspaceIds) {
+            if (!workspacePaths.has(id)) {
+              workspacePaths.set(id, normalizePath(workspacePath));
+            }
+          }
+        }
+        if (includeVersions) {
+          for (const [id, version] of readWorkspaceSessionVersionsFromDatabase(db, true)) {
+            if (ids.has(id) && !versions.has(id)) versions.set(id, version);
+          }
+        }
+      } finally {
+        db.close();
       }
-    } finally {
-      db.close();
     }
+  } finally {
+    workspaceZip?.close();
   }
-  return { ids, versions, warnings };
+  return { ids, versions, workspacePaths, warnings };
 }
 
 function readLocalSessionIds(
@@ -2660,6 +3030,45 @@ function getRestoreDestination(
     : join(userDir, platformPath);
 }
 
+interface SelectedTranscriptEntry {
+  entry: BackupFileEntry;
+  sessionId: string;
+  projectSlug: string;
+}
+
+function selectTranscriptEntries(
+  manifest: BackupManifest,
+  workspacePaths: Map<string, string>
+): SelectedTranscriptEntry[] {
+  const selected = new Map<string, SelectedTranscriptEntry>();
+  for (const entry of manifest.files) {
+    if (entry.type !== 'transcript') continue;
+    const match = entry.path.match(/^projects\/([^/]+)\/agent-transcripts\/([^/]+)\//);
+    if (!match?.[1] || !match[2]) continue;
+    const candidate: SelectedTranscriptEntry = {
+      entry,
+      projectSlug: match[1],
+      sessionId: match[2],
+    };
+    const existing = selected.get(candidate.sessionId);
+    if (!existing) {
+      selected.set(candidate.sessionId, candidate);
+      continue;
+    }
+    if (candidate.entry.size > existing.entry.size) {
+      selected.set(candidate.sessionId, candidate);
+      continue;
+    }
+    if (candidate.entry.size < existing.entry.size) continue;
+    const sourcePath = workspacePaths.get(candidate.sessionId);
+    const expectedSlug = sourcePath ? workspacePathToProjectSlug(sourcePath) : null;
+    if (expectedSlug === candidate.projectSlug && expectedSlug !== existing.projectSlug) {
+      selected.set(candidate.sessionId, candidate);
+    }
+  }
+  return [...selected.values()];
+}
+
 async function buildRestorePlan(
   config: RestoreConfig,
   manifest: BackupManifest,
@@ -2731,6 +3140,33 @@ async function buildRestorePlan(
     mode === 'merge'
       ? new Set([...sessionsToAdd, ...sessionsToUpdate, ...sessionsToSkip])
       : new Set(backupSessionIds);
+  const mappingConfig = loadWorkspaceMappingConfig(config);
+  const approvedMapper = new WorkspacePathMapper(mappingConfig);
+  const sourceWorkspaceSessions = new Map<string, Set<string>>();
+  for (const sessionId of rowMergeSessionIds) {
+    const sourcePath = backupSelection.workspacePaths.get(sessionId);
+    if (!sourcePath) continue;
+    const sessions = sourceWorkspaceSessions.get(sourcePath) ?? new Set<string>();
+    sessions.add(sessionId);
+    sourceWorkspaceSessions.set(sourcePath, sessions);
+  }
+  const localPathMap = buildLocalWorkspaceMap(localWorkspaceStorageDir);
+  const mappingResult = proposeWorkspaceMappings(
+    sourceWorkspaceSessions,
+    [...localPathMap.keys()],
+    mappingConfig,
+    config.autoMapWorkspaces === true
+  );
+  const mappingProposals = mappingResult.proposals;
+  const mappedWorkspacePaths = new Map(
+    mappingProposals.map((proposal) => [proposal.source, proposal.target])
+  );
+  const proposalsRequiringApproval = mappingProposals.filter(
+    (proposal) =>
+      proposal.confidence !== 'exact' &&
+      proposal.confidence !== 'explicit' &&
+      approvedMapper.resolve(proposal.source) === null
+  );
   const filesToCreate = new Set<string>();
   const filesToModify = new Set<string>();
   const filesToOverwrite = new Set<string>();
@@ -2739,6 +3175,47 @@ async function buildRestorePlan(
   const blockers: string[] = [];
   if (invalidConflictStrategy) {
     blockers.push(`Invalid conflict strategy: ${String(requestedConflictStrategy)}`);
+  }
+  if (config.autoMapWorkspaces && !config.dryRun) {
+    blockers.push(
+      '--auto-map-workspaces is proposal-only; real restore requires --workspace-map or explicit CLI mappings'
+    );
+  }
+  if (mappingResult.unmapped.length > 0) {
+    blockers.push(`Workspace mapping required for: ${mappingResult.unmapped.join(', ')}`);
+  }
+  if (proposalsRequiringApproval.length > 0) {
+    blockers.push(
+      `Proposed workspace mappings require approval through --workspace-map or explicit CLI mappings`
+    );
+  }
+  const missingMappingTargets = mappingProposals
+    .filter(
+      (proposal) =>
+        ![...localPathMap.keys()].some((path) => pathsEqual(path, proposal.target)) &&
+        !existsSync(proposal.target)
+    )
+    .map((proposal) => proposal.target);
+  if (missingMappingTargets.length > 0) {
+    blockers.push(`Mapped workspace target does not exist: ${missingMappingTargets.join(', ')}`);
+  }
+  if (
+    mode === 'overwrite' &&
+    mappingProposals.some((proposal) => !pathsEqual(proposal.source, proposal.target))
+  ) {
+    blockers.push('Cross-machine workspace path mappings require --merge');
+  }
+  let generatedMappingOutputPath: string | undefined;
+  if (config.dryRun && config.autoMapWorkspaces && proposalsRequiringApproval.length > 0) {
+    const defaultOutput = config.backupPath.toLowerCase().endsWith('.zip')
+      ? `${config.backupPath.slice(0, -4)}.workspace-map.toml`
+      : `${config.backupPath}.workspace-map.toml`;
+    generatedMappingOutputPath = writeWorkspaceMappingFile(
+      config.mappingOutputPath ?? defaultOutput,
+      config.backupPath,
+      proposalsRequiringApproval
+    );
+    warnings.push(`Workspace mapping proposal written to ${generatedMappingOutputPath}`);
   }
   const archivedTranscriptSessions = new Set<string>();
   let workspacesNew = 0;
@@ -2751,6 +3228,16 @@ async function buildRestorePlan(
   if (validation.status === 'warnings') {
     blockers.push(
       `Backup has ${validation.corruptedFiles.length} checksum-mismatched file(s); restore will not proceed`
+    );
+  }
+  const unregisteredMappingTargets = mappingProposals
+    .filter(
+      (proposal) => ![...localPathMap.keys()].some((path) => pathsEqual(path, proposal.target))
+    )
+    .map((proposal) => proposal.target);
+  if (unregisteredMappingTargets.length > 0) {
+    blockers.push(
+      `Open mapped workspace in Cursor once before restore: ${unregisteredMappingTargets.join(', ')}`
     );
   }
   const localScanErrors = [...localSelection.errors, ...localTranscriptSelection.errors];
@@ -2799,7 +3286,6 @@ async function buildRestorePlan(
       );
     }
 
-    const localPathMap = buildLocalWorkspaceMap(localWorkspaceStorageDir);
     const zip = await ZipReader.open(config.backupPath);
     try {
       const workspaceDbEntries = manifest.files.filter((entry) => entry.type === 'workspace-db');
@@ -2808,8 +3294,13 @@ async function buildRestorePlan(
         if (!match?.[1]) continue;
         const workspaceId = match[1];
         const backupWorkspacePath = await readBackupWorkspacePath(zip, workspaceId);
+        const mappedBackupWorkspacePath = backupWorkspacePath
+          ? (approvedMapper.resolve(backupWorkspacePath) ??
+            mappedWorkspacePaths.get(normalizePath(backupWorkspacePath)) ??
+            backupWorkspacePath)
+          : null;
         const localHash = matchLocalWorkspaceFolder(
-          backupWorkspacePath,
+          mappedBackupWorkspacePath,
           workspaceId,
           localPathMap,
           localWorkspaceStorageDir
@@ -2822,11 +3313,27 @@ async function buildRestorePlan(
             workspacesMerged++;
           } else {
             blockers.push(
-              `Workspace ${backupWorkspacePath ?? workspaceId} matched ${localHash}, but its local database is missing`
+              `Workspace ${mappedBackupWorkspacePath ?? workspaceId} matched ${localHash}, but its local database is missing`
             );
           }
           const workspaceJson = join(localWorkspaceStorageDir, localHash, 'workspace.json');
           if (existsSync(workspaceJson)) filesToSkip.add(workspaceJson);
+          continue;
+        }
+
+        if (
+          backupWorkspacePath &&
+          mappedBackupWorkspacePath &&
+          !pathsEqual(backupWorkspacePath, mappedBackupWorkspacePath)
+        ) {
+          blockers.push(
+            `Open mapped workspace in Cursor once before restore: ${mappedBackupWorkspacePath}`
+          );
+          for (const file of manifest.files.filter((item) =>
+            item.path.startsWith(`workspaceStorage/${workspaceId}/`)
+          )) {
+            filesToSkip.add(getRestoreDestination(userDir, file.path, projectsDir));
+          }
           continue;
         }
 
@@ -2863,15 +3370,27 @@ async function buildRestorePlan(
       }
     }
 
-    for (const entry of manifest.files) {
-      if (entry.type !== 'transcript') continue;
-      const match = entry.path.match(/^projects\/[^/]+\/agent-transcripts\/([^/]+)\//);
-      const sessionId = match?.[1];
-      if (!sessionId || !selectedSessionIds.has(sessionId)) {
+    for (const transcript of selectTranscriptEntries(manifest, backupSelection.workspacePaths)) {
+      const { entry, sessionId } = transcript;
+      if (!selectedSessionIds.has(sessionId)) {
         filesToSkip.add(getRestoreDestination(userDir, entry.path, projectsDir));
         continue;
       }
-      const destination = getRestoreDestination(userDir, entry.path, projectsDir);
+      const sourceWorkspace = backupSelection.workspacePaths.get(sessionId);
+      const targetWorkspace = sourceWorkspace
+        ? (approvedMapper.resolve(sourceWorkspace) ??
+          mappedWorkspacePaths.get(sourceWorkspace) ??
+          sourceWorkspace)
+        : null;
+      const destination = targetWorkspace
+        ? join(
+            projectsDir,
+            workspacePathToProjectSlug(targetWorkspace),
+            'agent-transcripts',
+            sessionId,
+            basename(entry.path)
+          )
+        : getRestoreDestination(userDir, entry.path, projectsDir);
       if (existsSync(destination)) {
         if (sessionsToUpdate.has(sessionId)) {
           filesToModify.add(destination);
@@ -2971,6 +3490,11 @@ async function buildRestorePlan(
     sessionsToSkip: mode === 'merge' ? sessionsToSkip.size : 0,
     conflictingSessionIds,
     unresolvedConflictIds: [...unresolvedConflictIds].sort(),
+    workspaceMappings: mappingProposals,
+    unmappedWorkspacePaths: mappingResult.unmapped,
+    ...(generatedMappingOutputPath && {
+      mappingOutputPath: generatedMappingOutputPath,
+    }),
     workspacesNew,
     workspacesMerged,
     transcriptFilesToCopy,
@@ -2991,6 +3515,10 @@ async function buildRestorePlan(
     selectedSessionIds,
     rowMergeSessionIds,
     backupVersions: backupSelection.versions,
+    backupWorkspacePaths: backupSelection.workspacePaths,
+    mappedWorkspacePaths,
+    mappingConfig,
+    targetWorkspaceIds: localPathMap,
     localVersions: localSelection.versions,
     localGlobalVersions: localSelection.globalVersions,
     localWorkspaceVersions: localSelection.workspaceVersions,
@@ -3142,6 +3670,10 @@ export async function restoreBackup(config: RestoreConfig): Promise<RestoreResul
       planContext.sessionsToUpdate,
       planContext.localGlobalVersions,
       planContext.localWorkspaceVersions,
+      planContext.mappingConfig,
+      planContext.backupWorkspacePaths,
+      planContext.mappedWorkspacePaths,
+      planContext.targetWorkspaceIds,
       planContext.plan,
       backupFingerprint,
       projectsPath,
@@ -3342,6 +3874,10 @@ async function restoreBackupMerge(
   sessionsToUpdate: Set<string>,
   expectedLocalVersions: Map<string, SessionVersion>,
   expectedWorkspaceVersions: Map<string, SessionVersion>,
+  mappingConfig: WorkspaceMappingConfigData,
+  backupWorkspacePaths: Map<string, string>,
+  mappedWorkspacePaths: Map<string, string>,
+  targetWorkspaceIds: Map<string, string>,
   plan: RestorePlan,
   backupFingerprint: BackupFingerprint,
   projectsPath: string,
@@ -3415,6 +3951,43 @@ async function restoreBackupMerge(
     }
     assertBackupUnchanged(backupPath, backupFingerprint);
 
+    const workspaceMapper = new WorkspacePathMapper(mappingConfig);
+    const hasWorkspaceMappings =
+      mappingConfig.pathPrefixes.length > 0 || mappingConfig.workspaces.length > 0;
+    const stagedGlobalDb = join(tempDir, 'globalStorage', 'state.vscdb');
+    if (existsSync(stagedGlobalDb)) {
+      applyWorkspaceMappingsToBackupGlobalDb(
+        stagedGlobalDb,
+        selectedSessionIds,
+        rowMergeSessionIds,
+        workspaceMapper,
+        targetWorkspaceIds
+      );
+    }
+    if (hasWorkspaceMappings) {
+      const stagedWorkspaceDir = join(tempDir, 'workspaceStorage');
+      if (existsSync(stagedWorkspaceDir)) {
+        for (const entry of readdirSync(stagedWorkspaceDir, {
+          withFileTypes: true,
+        })) {
+          if (!entry.isDirectory()) continue;
+          const workspaceDir = join(stagedWorkspaceDir, entry.name);
+          const workspaceDb = join(workspaceDir, 'state.vscdb');
+          if (existsSync(workspaceDb)) {
+            applyWorkspaceMappingsToBackupWorkspaceDb(workspaceDb, workspaceMapper);
+          }
+          const workspaceJson = join(workspaceDir, 'workspace.json');
+          if (existsSync(workspaceJson)) {
+            const value = rewriteJsonRowValue(
+              readFileSync(workspaceJson, 'utf-8'),
+              workspaceMapper
+            );
+            if (value) writeFileSync(workspaceJson, value, 'utf-8');
+          }
+        }
+      }
+    }
+
     for (const target of plan.filesToCreate) {
       if (existsSync(target)) {
         throw new Error(`Target appeared after preflight: ${target}`);
@@ -3486,6 +4059,11 @@ async function restoreBackupMerge(
             throw new Error(`Matched workspace database disappeared: ${localDbPath}`);
           }
         } else {
+          if (backupWsPath && targetWorkspaceIds.has(normalizePath(backupWsPath))) {
+            throw new Error(
+              `Mapped workspace registration disappeared after preflight: ${backupWsPath}`
+            );
+          }
           // Path not found locally: copy entire workspace folder
           const destFolder = join(localWorkspaceStorageDir, entry.name);
           if (!existsSync(destFolder)) {
@@ -3570,64 +4148,61 @@ async function restoreBackupMerge(
       appliedFingerprints.set(localGlobalDbPath, getFileFingerprint(localGlobalDbPath));
     }
 
-    // Copy agent transcript JSONL files to ~/.cursor/projects/
-    const backupProjectsDir = join(tempDir, 'projects');
-    if (existsSync(backupProjectsDir)) {
-      const localProjectsDir = projectsPath;
-      try {
-        const projEntries = readdirSync(backupProjectsDir, { withFileTypes: true });
-        for (const projEntry of projEntries) {
-          if (projEntry.isDirectory() === false) continue;
-          const backupTranscriptsDir = join(backupProjectsDir, projEntry.name, 'agent-transcripts');
-          if (existsSync(backupTranscriptsDir) === false) continue;
-
-          const localTranscriptsDir = join(localProjectsDir, projEntry.name, 'agent-transcripts');
-          const sessionDirs = readdirSync(backupTranscriptsDir, { withFileTypes: true });
-          for (const sessionDir of sessionDirs) {
-            if (sessionDir.isDirectory() === false) continue;
-            if (!selectedSessionIds.has(sessionDir.name)) continue;
-            const destSessionDir = join(localTranscriptsDir, sessionDir.name);
-            const isUpdate = sessionsToUpdate.has(sessionDir.name);
-            if (existsSync(destSessionDir) && !isUpdate) {
-              throw new Error(
-                `Transcript session appeared after preflight and cannot be merged safely: ${destSessionDir}`
-              );
-            }
-
-            mkdirSync(localTranscriptsDir, { recursive: true });
-            if (!existsSync(destSessionDir)) {
-              mkdirSync(destSessionDir);
-              createdDirectories.add(destSessionDir);
-            }
-            const backupFiles = readdirSync(join(backupTranscriptsDir, sessionDir.name));
-            for (const f of backupFiles) {
-              const destination = join(destSessionDir, f);
-              const source = join(backupTranscriptsDir, sessionDir.name, f);
-              if (existsSync(destination)) {
-                if (!isUpdate || !plan.filesToModify.includes(destination)) {
-                  throw new Error(`Transcript file appeared after preflight: ${destination}`);
-                }
-                const expected = snapshotOriginals.get(destination);
-                if (!expected || !fingerprintsEqual(expected, getFileFingerprint(destination))) {
-                  throw new Error(`Transcript file changed after preflight: ${destination}`);
-                }
-                mutationAttemptedTargets.add(destination);
-                copyFileSync(source, destination);
-              } else {
-                copyFileSync(source, destination, fsConstants.COPYFILE_EXCL);
-                createdTargets.add(destination);
-              }
-              appliedFingerprints.set(destination, getFileFingerprint(destination));
-            }
-          }
+    // Copy one canonical transcript per session, remapping its project slug.
+    try {
+      for (const transcript of selectTranscriptEntries(manifest, backupWorkspacePaths)) {
+        const { entry, sessionId } = transcript;
+        if (!selectedSessionIds.has(sessionId)) continue;
+        const sourceWorkspace = backupWorkspacePaths.get(sessionId);
+        const targetWorkspace = sourceWorkspace
+          ? (workspaceMapper.resolve(sourceWorkspace) ??
+            mappedWorkspacePaths.get(sourceWorkspace) ??
+            sourceWorkspace)
+          : null;
+        const destination = targetWorkspace
+          ? join(
+              projectsPath,
+              workspacePathToProjectSlug(targetWorkspace),
+              'agent-transcripts',
+              sessionId,
+              basename(entry.path)
+            )
+          : getRestoreDestination(userDir, entry.path, projectsPath);
+        const source = join(tempDir, entry.path.split('/').join(sep));
+        const destSessionDir = dirname(destination);
+        const isUpdate = sessionsToUpdate.has(sessionId);
+        if (existsSync(destSessionDir) && !isUpdate) {
+          throw new Error(
+            `Transcript session appeared after preflight and cannot be merged safely: ${destSessionDir}`
+          );
         }
-      } catch (transcriptError) {
-        throw new Error(
-          `Transcript restore failed: ${
-            transcriptError instanceof Error ? transcriptError.message : String(transcriptError)
-          }`
-        );
+        mkdirSync(dirname(destSessionDir), { recursive: true });
+        if (!existsSync(destSessionDir)) {
+          mkdirSync(destSessionDir);
+          createdDirectories.add(destSessionDir);
+        }
+        if (existsSync(destination)) {
+          if (!isUpdate || !plan.filesToModify.includes(destination)) {
+            throw new Error(`Transcript file appeared after preflight: ${destination}`);
+          }
+          const expected = snapshotOriginals.get(destination);
+          if (!expected || !fingerprintsEqual(expected, getFileFingerprint(destination))) {
+            throw new Error(`Transcript file changed after preflight: ${destination}`);
+          }
+          mutationAttemptedTargets.add(destination);
+          copyFileSync(source, destination);
+        } else {
+          copyFileSync(source, destination, fsConstants.COPYFILE_EXCL);
+          createdTargets.add(destination);
+        }
+        appliedFingerprints.set(destination, getFileFingerprint(destination));
       }
+    } catch (transcriptError) {
+      throw new Error(
+        `Transcript restore failed: ${
+          transcriptError instanceof Error ? transcriptError.message : String(transcriptError)
+        }`
+      );
     }
 
     onProgress?.({
