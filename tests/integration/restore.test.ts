@@ -330,6 +330,25 @@ function readSidebarHeader(
   }
 }
 
+function readModernSidebarHeader(
+  databasePath: string,
+  sessionId: string
+): Record<string, unknown> | null {
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const hasTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'composerHeaders'")
+      .get();
+    if (!hasTable) return null;
+    const row = db
+      .prepare('SELECT value FROM composerHeaders WHERE composerId = ?')
+      .get(sessionId) as { value: string } | undefined;
+    return row ? (JSON.parse(row.value) as Record<string, unknown>) : null;
+  } finally {
+    db.close();
+  }
+}
+
 function updateSessionMetadata(
   databasePath: string,
   sessionId: string,
@@ -583,6 +602,16 @@ describe('restore preflight and additive merge', () => {
         }
       ).id
     ).toBe('mapped-hash');
+    expect(
+      (
+        readModernSidebarHeader(paths.localGlobalDbPath, 'remote-session')?.[
+          'workspaceIdentifier'
+        ] as { id?: string }
+      ).id
+    ).toBe('mapped-hash');
+    expect(readModernSidebarHeader(paths.localGlobalDbPath, 'local-session')?.['name']).toBe(
+      'Local'
+    );
     expect(readSessionBubble(paths.localGlobalDbPath, 'remote-session')).toContain(
       `${targetWorkspace}/file.ts`
     );
