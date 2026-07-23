@@ -407,6 +407,8 @@ export interface BackupScope {
   since?: string;
   /** Exact session import set for filtered backups */
   sessionIds?: string[];
+  /** Exact content-addressed agent blobs included for continuation */
+  agentBlobHashes?: string[];
 }
 
 /**
