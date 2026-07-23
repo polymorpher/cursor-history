@@ -183,6 +183,7 @@ import {
   createBackup,
   restoreBackup,
   openBackupDatabase,
+  extractConversationStateBlobHashes,
 } from '../../src/core/backup.js';
 
 beforeEach(() => {
@@ -216,6 +217,28 @@ describe('computeChecksum', () => {
 
   it('produces different results for different input', () => {
     expect(computeChecksum(Buffer.from('a'))).not.toBe(computeChecksum(Buffer.from('b')));
+  });
+});
+
+describe('extractConversationStateBlobHashes', () => {
+  it('extracts repeated 32-byte protobuf blob references', () => {
+    const first = 'ab'.repeat(32);
+    const second = 'cd'.repeat(32);
+    const nonBlob = 'ef'.repeat(32);
+    const state = Buffer.concat([
+      Buffer.from([0x0a, 0x20]),
+      Buffer.from(first, 'hex'),
+      Buffer.from([0x0a, 0x20]),
+      Buffer.from(second, 'hex'),
+      Buffer.from([0x7a, 0x20]), // field 15: another 32-byte payload
+      Buffer.from(nonBlob, 'hex'),
+    ]);
+
+    expect(
+      extractConversationStateBlobHashes(
+        JSON.stringify({ conversationState: `~${state.toString('base64')}` })
+      )
+    ).toEqual(new Set([first, second]));
   });
 });
 

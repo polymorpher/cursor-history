@@ -15,6 +15,7 @@ import yazl from 'yazl';
 import {
   computeChecksum,
   createBackup,
+  openBackupDatabase,
   readBackupManifest,
   restoreBackup,
 } from '../../src/core/backup.js';
@@ -26,6 +27,8 @@ interface TestSession {
   name: string;
   lastUpdatedAt?: number;
   workspacePath?: string;
+  parentSessionId?: string;
+  agentBlobHashes?: string[];
 }
 
 let testRoot: string;
@@ -52,6 +55,14 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
     const insertKv = db.prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)');
     for (const session of sessions) {
       const bubbleId = `${session.id}-bubble`;
+      const conversationState = session.agentBlobHashes
+        ? `~${Buffer.concat(
+            session.agentBlobHashes.flatMap((hash) => [
+              Buffer.from([0x0a, 0x20]),
+              Buffer.from(hash, 'hex'),
+            ])
+          ).toString('base64')}`
+        : undefined;
       insertKv.run(
         `composerData:${session.id}`,
         JSON.stringify({
@@ -64,9 +75,18 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
               uri: { fsPath: session.workspacePath },
             },
           }),
+          ...(session.parentSessionId && {
+            subagentInfo: {
+              parentComposerId: session.parentSessionId,
+            },
+          }),
+          ...(conversationState && { conversationState }),
           fullConversationHeadersOnly: [{ bubbleId, type: 1 }],
         })
       );
+      for (const hash of session.agentBlobHashes ?? []) {
+        insertKv.run(`agentKv:blob:${hash}`, JSON.stringify({ hash, sessionId: session.id }));
+      }
       insertKv.run(
         `bubbleId:${session.id}:${bubbleId}`,
         JSON.stringify({
@@ -79,8 +99,25 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
               }),
             },
           }),
+          ...(session.parentSessionId && {
+            subagentInfo: {
+              parentComposerId: session.parentSessionId,
+            },
+          }),
         })
       );
+      if (session.workspacePath) {
+        insertKv.run(
+          `messageRequestContext:${session.id}:request-1`,
+          JSON.stringify({
+            targetFile: `${session.workspacePath}/context.ts`,
+          })
+        );
+        insertKv.run(
+          `ofsContent:${session.id}:file://${session.workspacePath}/file.ts`,
+          'source file content'
+        );
+      }
     }
 
     db.prepare('INSERT INTO ItemTable (key, value) VALUES (?, ?)').run(
@@ -93,6 +130,11 @@ function createGlobalDatabase(path: string, sessions: TestSession[]): void {
           ...(session.workspacePath && {
             workspaceIdentifier: {
               uri: { fsPath: session.workspacePath },
+            },
+          }),
+          ...(session.parentSessionId && {
+            subagentInfo: {
+              parentComposerId: session.parentSessionId,
             },
           }),
         })),
@@ -349,6 +391,26 @@ function readModernSidebarHeader(
   }
 }
 
+function readModernHeaderClassification(
+  databasePath: string,
+  sessionId: string
+): { isSubagent: number; value: Record<string, unknown> } | null {
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const row = db
+      .prepare('SELECT isSubagent, value FROM composerHeaders WHERE composerId = ?')
+      .get(sessionId) as { isSubagent: number; value: string } | undefined;
+    return row
+      ? {
+          isSubagent: row.isSubagent,
+          value: JSON.parse(row.value) as Record<string, unknown>,
+        }
+      : null;
+  } finally {
+    db.close();
+  }
+}
+
 function updateSessionMetadata(
   databasePath: string,
   sessionId: string,
@@ -456,6 +518,45 @@ describe('filtered backup scope', () => {
           }),
         ])
       );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env['HOME'];
+      } else {
+        process.env['HOME'] = previousHome;
+      }
+    }
+  });
+
+  it('includes agent context blobs referenced by conversationState', async () => {
+    const sourcePath = join(testRoot, 'source', 'User', 'workspaceStorage');
+    mkdirSync(sourcePath, { recursive: true });
+    const hash = 'ab'.repeat(32);
+    createGlobalDatabase(join(testRoot, 'source', 'User', 'globalStorage', 'state.vscdb'), [
+      {
+        id: 'agent-session',
+        name: 'Agent Session',
+        lastUpdatedAt: Date.now(),
+        agentBlobHashes: [hash],
+      },
+    ]);
+    const backupPath = join(testRoot, 'agent-filtered.zip');
+    const previousHome = process.env['HOME'];
+    process.env['HOME'] = testRoot;
+
+    try {
+      const result = await createBackup({
+        sourcePath,
+        outputPath: backupPath,
+        since: new Date(Date.now() - 60_000),
+      });
+      const db = await openBackupDatabase(backupPath, 'globalStorage/state.vscdb');
+      const blob = db
+        .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+        .get(`agentKv:blob:${hash}`);
+      db.close();
+
+      expect(result.success).toBe(true);
+      expect(blob).toBeDefined();
     } finally {
       if (previousHome === undefined) {
         delete process.env['HOME'];
@@ -615,6 +716,18 @@ describe('restore preflight and additive merge', () => {
     expect(readSessionBubble(paths.localGlobalDbPath, 'remote-session')).toContain(
       `${targetWorkspace}/file.ts`
     );
+    const mappedDb = new Database(paths.localGlobalDbPath, { readonly: true });
+    const requestContext = mappedDb
+      .prepare('SELECT value FROM cursorDiskKV WHERE key = ?')
+      .get('messageRequestContext:remote-session:request-1') as {
+      value: string;
+    };
+    const ofsRow = mappedDb
+      .prepare('SELECT key FROM cursorDiskKV WHERE key = ?')
+      .get(`ofsContent:remote-session:file://${targetWorkspace}/file.ts`);
+    mappedDb.close();
+    expect(requestContext.value).toContain(`${targetWorkspace}/context.ts`);
+    expect(ofsRow).toBeDefined();
     expect(
       readFileSync(
         join(
@@ -647,6 +760,75 @@ describe('restore preflight and additive merge', () => {
     expect(result.mergeStats?.sessionsUpdated).toBe(0);
     expect(readSessionName(paths.localGlobalDbPath, 'local-session')).toBe('Local');
     expect(readSessionName(paths.localGlobalDbPath, 'remote-session')).toBe('Remote');
+  });
+
+  it('keeps subagent sessions under their parent instead of the legacy sidebar', async () => {
+    const paths = testPaths();
+    createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
+    createGlobalDatabase(paths.backupDbPath, [
+      { id: 'parent-session', name: 'Parent Session' },
+      {
+        id: 'child-session',
+        name: 'Child Agent',
+        parentSessionId: 'parent-session',
+      },
+    ]);
+    await createBackupArchive(paths.backupDbPath, paths.backupPath, {
+      type: 'full',
+    });
+
+    const result = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      merge: true,
+      synthesizeTranscripts: false,
+    });
+    const child = readModernHeaderClassification(paths.localGlobalDbPath, 'child-session');
+
+    expect(result.success).toBe(true);
+    expect(readSidebarHeader(paths.localGlobalDbPath, 'parent-session')).not.toBeNull();
+    expect(readSidebarHeader(paths.localGlobalDbPath, 'child-session')).toBeNull();
+    expect(child?.isSubagent).toBe(1);
+    expect((child?.value['subagentInfo'] as { parentComposerId?: string }).parentComposerId).toBe(
+      'parent-session'
+    );
+
+    const localDb = new Database(paths.localGlobalDbPath);
+    const headersRow = localDb
+      .prepare("SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'")
+      .get() as { value: string };
+    const headers = JSON.parse(headersRow.value) as {
+      allComposers: Array<Record<string, unknown>>;
+    };
+    headers.allComposers.push({
+      type: 'head',
+      composerId: 'child-session',
+      name: 'Child Agent',
+      createdAt: 1,
+      lastUpdatedAt: 2,
+    });
+    localDb
+      .prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'")
+      .run(JSON.stringify(headers));
+    localDb
+      .prepare(
+        "UPDATE composerHeaders SET isSubagent = 0, value = json_remove(value, '$.subagentInfo') WHERE composerId = 'child-session'"
+      )
+      .run();
+    localDb.close();
+
+    const repaired = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      merge: true,
+      conflictStrategy: 'backup',
+      synthesizeTranscripts: false,
+    });
+    expect(repaired.success).toBe(true);
+    expect(readSidebarHeader(paths.localGlobalDbPath, 'child-session')).toBeNull();
+    expect(
+      readModernHeaderClassification(paths.localGlobalDbPath, 'child-session')?.isSubagent
+    ).toBe(1);
   });
 
   it('blocks overlapping sessions without replacing local metadata', async () => {
@@ -1067,6 +1249,37 @@ describe('restore preflight and additive merge', () => {
 
     expect(result.success).toBe(true);
     expect(readSidebarHeader(paths.localGlobalDbPath, 'remote-session')?.['name']).toBe('Remote');
+  });
+
+  it('blocks restore when referenced agent context blobs are absent', async () => {
+    const paths = testPaths();
+    const hash = 'ef'.repeat(32);
+    createGlobalDatabase(paths.localGlobalDbPath, [{ id: 'local-session', name: 'Local' }]);
+    createGlobalDatabase(paths.backupDbPath, [
+      {
+        id: 'remote-session',
+        name: 'Remote',
+        agentBlobHashes: [hash],
+      },
+    ]);
+    const sourceDb = new Database(paths.backupDbPath);
+    sourceDb.prepare('DELETE FROM cursorDiskKV WHERE key = ?').run(`agentKv:blob:${hash}`);
+    sourceDb.close();
+    await createBackupArchive(paths.backupDbPath, paths.backupPath, {
+      type: 'full',
+    });
+
+    const result = await restoreBackup({
+      backupPath: paths.backupPath,
+      targetPath: paths.targetPath,
+      merge: true,
+      dryRun: true,
+      synthesizeTranscripts: false,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.plan?.missingAgentBlobCount).toBe(1);
+    expect(result.error).toContain('agent context blob');
   });
 
   it('dry-runs overwrite mode without replacing an existing database', async () => {
