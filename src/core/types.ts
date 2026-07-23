@@ -517,6 +517,8 @@ export interface RestorePlan {
   transcriptFilesToCopy: number;
   /** Missing transcript candidates that synthesis would examine */
   transcriptCandidatesToSynthesize: number;
+  /** Referenced agent context blobs missing from the backup */
+  missingAgentBlobCount: number;
   /** Destination files that would be created */
   filesToCreate: string[];
   /** Existing destination files that would be modified through a merge */

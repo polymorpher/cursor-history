@@ -70,6 +70,7 @@ describe('restore command dry run', () => {
         workspacesMerged: 0,
         transcriptFilesToCopy: 0,
         transcriptCandidatesToSynthesize: 1,
+        missingAgentBlobCount: 0,
         filesToCreate: [],
         filesToModify: [],
         filesToOverwrite: [],

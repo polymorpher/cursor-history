@@ -633,6 +633,7 @@ export interface RestorePlan {
   workspacesMerged: number;
   transcriptFilesToCopy: number;
   transcriptCandidatesToSynthesize: number;
+  missingAgentBlobCount: number;
   filesToCreate: string[];
   filesToModify: string[];
   filesToOverwrite: string[];

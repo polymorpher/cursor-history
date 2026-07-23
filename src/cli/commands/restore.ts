@@ -129,6 +129,7 @@ function formatRestoreResult(result: RestoreResult): string {
     lines.push(
       `  ${pc.bold('Transcript synthesis candidates:')} ${plan.transcriptCandidatesToSynthesize}`
     );
+    lines.push(`  ${pc.bold('Missing agent context blobs:')} ${plan.missingAgentBlobCount}`);
 
     if (plan.workspaceMappings.length > 0) {
       lines.push('');
