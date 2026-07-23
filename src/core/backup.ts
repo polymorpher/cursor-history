@@ -771,6 +771,7 @@ async function createFilteredGlobalDb(
     destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS cursorDiskKV_key ON cursorDiskKV(key)');
     destDb.runSQL('CREATE TABLE IF NOT EXISTS ItemTable (key TEXT NOT NULL, value TEXT NOT NULL)');
     destDb.runSQL('CREATE UNIQUE INDEX IF NOT EXISTS ItemTable_key ON ItemTable(key)');
+    ensureComposerHeadersTable(destDb);
 
     const insertStmt = destDb.prepare(
       'INSERT OR IGNORE INTO cursorDiskKV (key, value) VALUES (?, ?)'
@@ -827,6 +828,51 @@ async function createFilteredGlobalDb(
       }
     } catch {
       // ItemTable may not exist in older Cursor versions
+    }
+    try {
+      const hasHeaderTable = sourceDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'composerHeaders'")
+        .get();
+      if (hasHeaderTable) {
+        const selectHeader = sourceDb.prepare(
+          'SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
+            'isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ?'
+        );
+        const insertHeader = destDb.prepare(
+          'INSERT OR REPLACE INTO composerHeaders ' +
+            '(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
+            'isSubagent, recency, checkpointAt, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        for (const id of sessionIds) {
+          const row = selectHeader.get(id) as
+            | {
+                composerId: string;
+                workspaceId: string | null;
+                createdAt: number | null;
+                lastUpdatedAt: number | null;
+                isArchived: number;
+                isSubagent: number;
+                recency: number;
+                checkpointAt: number | null;
+                value: string;
+              }
+            | undefined;
+          if (!row) continue;
+          insertHeader.run(
+            row.composerId,
+            row.workspaceId,
+            row.createdAt,
+            row.lastUpdatedAt,
+            row.isArchived,
+            row.isSubagent,
+            row.recency,
+            row.checkpointAt,
+            row.value
+          );
+        }
+      }
+    } catch {
+      // Restore can synthesize table rows from composerData if necessary.
     }
   } finally {
     destDb.close();
@@ -1868,6 +1914,57 @@ function composerDataToHeader(
   return header;
 }
 
+function ensureComposerHeadersTable(db: DatabaseInterface): void {
+  db.runSQL(
+    'CREATE TABLE IF NOT EXISTS composerHeaders (' +
+      'composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, ' +
+      'lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, ' +
+      'recency INTEGER, checkpointAt INTEGER, value TEXT)'
+  );
+}
+
+function composerHeaderTableValues(header: Record<string, unknown>): {
+  composerId: string;
+  workspaceId: string | null;
+  createdAt: number | null;
+  lastUpdatedAt: number | null;
+  isArchived: number;
+  isSubagent: number;
+  recency: number;
+  checkpointAt: number | null;
+  value: string;
+} | null {
+  const composerId = header['composerId'];
+  if (typeof composerId !== 'string' || composerId.length === 0) return null;
+  const identifier =
+    header['workspaceIdentifier'] && typeof header['workspaceIdentifier'] === 'object'
+      ? (header['workspaceIdentifier'] as Record<string, unknown>)
+      : undefined;
+  const workspaceId = typeof identifier?.['id'] === 'string' ? identifier['id'] : null;
+  const createdAt = parseTimestampValue(header['createdAt']) ?? null;
+  const lastUpdatedAt = parseTimestampValue(header['lastUpdatedAt']) ?? null;
+  const checkpointAt = parseTimestampValue(header['conversationCheckpointLastUpdatedAt']) ?? null;
+  const subagentInfo =
+    header['subagentInfo'] && typeof header['subagentInfo'] === 'object'
+      ? (header['subagentInfo'] as Record<string, unknown>)
+      : undefined;
+  const isSubagent =
+    header['isBestOfNSubcomposer'] === true ||
+    composerId.startsWith('task-') ||
+    typeof subagentInfo?.['parentComposerId'] === 'string';
+  return {
+    composerId,
+    workspaceId,
+    createdAt,
+    lastUpdatedAt,
+    isArchived: header['isArchived'] === true ? 1 : 0,
+    isSubagent: isSubagent ? 1 : 0,
+    recency: lastUpdatedAt ?? createdAt ?? 0,
+    checkpointAt,
+    value: JSON.stringify(header),
+  };
+}
+
 function applyWorkspaceMappingsToBackupGlobalDb(
   globalDbPath: string,
   metadataSessionIds: Set<string>,
@@ -1968,6 +2065,29 @@ function applyWorkspaceMappingsToBackupGlobalDb(
         );
       }
       changed++;
+    }
+    ensureComposerHeadersTable(db);
+    const upsertHeader = db.prepare(
+      'INSERT OR REPLACE INTO composerHeaders ' +
+        '(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
+        'isSubagent, recency, checkpointAt, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    for (const header of allComposers) {
+      const id = header['composerId'];
+      if (typeof id !== 'string' || !metadataSessionIds.has(id)) continue;
+      const values = composerHeaderTableValues(header);
+      if (!values) continue;
+      upsertHeader.run(
+        values.composerId,
+        values.workspaceId,
+        values.createdAt,
+        values.lastUpdatedAt,
+        values.isArchived,
+        values.isSubagent,
+        values.recency,
+        values.checkpointAt,
+        values.value
+      );
     }
     db.runSQL('COMMIT');
     return changed;
@@ -2217,17 +2337,78 @@ function mergeComposerHeaders(
       }
     }
 
-    if (changed === 0) return 0;
+    if (changed > 0) {
+      const merged = JSON.stringify({ ...localData, allComposers: localHeaders });
+      if (localRow) {
+        localDb
+          .prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'")
+          .run(merged);
+      } else {
+        localDb
+          .prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)")
+          .run(merged);
+      }
+    }
 
-    const merged = JSON.stringify({ ...localData, allComposers: localHeaders });
-    if (localRow) {
-      localDb
-        .prepare("UPDATE ItemTable SET value = ? WHERE key = 'composer.composerHeaders'")
-        .run(merged);
-    } else {
-      localDb
-        .prepare("INSERT INTO ItemTable (key, value) VALUES ('composer.composerHeaders', ?)")
-        .run(merged);
+    ensureComposerHeadersTable(localDb);
+    const existingHeader = localDb.prepare('SELECT 1 FROM composerHeaders WHERE composerId = ?');
+    const insertHeader = localDb.prepare(
+      'INSERT OR IGNORE INTO composerHeaders ' +
+        '(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
+        'isSubagent, recency, checkpointAt, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    const replaceHeader = localDb.prepare(
+      'INSERT OR REPLACE INTO composerHeaders ' +
+        '(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, ' +
+        'isSubagent, recency, checkpointAt, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    let tableChanged = 0;
+    for (const header of localHeaders) {
+      const values = composerHeaderTableValues(header);
+      if (!values) continue;
+      const result = insertHeader.run(
+        values.composerId,
+        values.workspaceId,
+        values.createdAt,
+        values.lastUpdatedAt,
+        values.isArchived,
+        values.isSubagent,
+        values.recency,
+        values.checkpointAt,
+        values.value
+      );
+      tableChanged += Number(result.changes);
+    }
+    for (const header of backupHeaders) {
+      const id = header['composerId'];
+      if (typeof id !== 'string' || !allowedSessionIds.has(id)) continue;
+      const values = composerHeaderTableValues(header);
+      if (!values) continue;
+      const params = [
+        values.composerId,
+        values.workspaceId,
+        values.createdAt,
+        values.lastUpdatedAt,
+        values.isArchived,
+        values.isSubagent,
+        values.recency,
+        values.checkpointAt,
+        values.value,
+      ] as const;
+      if (existingHeader.get(id)) {
+        if (!updateSessionIds.has(id)) continue;
+        replaceHeader.run(...params);
+      } else {
+        insertHeader.run(...params);
+      }
+      tableChanged++;
+    }
+    if (tableChanged > 0) {
+      const upsertItem = localDb.prepare(
+        'INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)'
+      );
+      upsertItem.run('composer.composerHeaders.tableGateEnabled', 'true');
+      upsertItem.run('composer.composerHeaders.version', `${Date.now()}-${tableChanged}`);
     }
 
     try {
@@ -2235,7 +2416,7 @@ function mergeComposerHeaders(
     } catch {
       /* best-effort */
     }
-    return changed;
+    return Math.max(changed, tableChanged);
   } finally {
     localDb.close();
   }
