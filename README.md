@@ -388,6 +388,17 @@ cursor-history restore backup.zip --merge --auto-resolve-conflicts
 cursor-history restore backup.zip --merge --conflict-strategy local
 cursor-history restore backup.zip --merge --conflict-strategy backup
 
+# Cross-user/machine restore: generate a TOML mapping proposal
+cursor-history restore backup.zip --merge --dry-run --auto-map-workspaces
+
+# Review the generated TOML, then explicitly approve it for the real restore
+cursor-history restore backup.zip --merge \
+  --workspace-map backup.workspace-map.toml
+
+# Simple path-prefix mappings can be supplied directly
+cursor-history restore backup.zip --merge \
+  --map-path-prefix "/Users/source=/Users/destination"
+
 # Restore from a backup (overwrite)
 cursor-history restore ~/cursor-history-backups/backup.zip --force
 
@@ -403,6 +414,24 @@ Merge restore aborts on overlapping IDs by default. Use
 only when the backup timestamp is newer, or choose `local`, `backup`, or `abort`
 explicitly. Filtered backups must use `--merge`; they cannot use overwrite
 restore.
+
+Workspace mappings are never auto-applied during a real restore. A dry run with
+`--auto-map-workspaces` writes a proposed TOML file beside the backup (override
+with `--mapping-output`). Review/edit it and pass it back with
+`--workspace-map`, or use repeatable `--map-path-prefix` /
+`--map-workspace` CLI options.
+
+```toml
+version = 1
+
+[[path_prefix]]
+source = "/Users/polymorpher"
+target = "/Users/agent"
+
+[[workspace]]
+source = "/Users/polymorpher/lp-code/lp-projects.code-workspace"
+target = "/Users/agent/lp-code/lp-projects.code-workspace"
+```
 
 See [LOCAL_MIGRATION.md](LOCAL_MIGRATION.md) for cross-machine migration workflows.
 

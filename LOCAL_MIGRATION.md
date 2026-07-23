@@ -34,6 +34,11 @@ cursor-history restore /path/to/backup.zip --merge
 cursor-history restore /path/to/backup.zip --merge --dry-run --auto-resolve-conflicts
 cursor-history restore /path/to/backup.zip --merge --auto-resolve-conflicts
 
+# If usernames/project roots differ, generate and review a mapping proposal
+cursor-history restore /path/to/backup.zip --merge --dry-run --auto-map-workspaces
+cursor-history restore /path/to/backup.zip --merge \
+  --workspace-map /path/to/backup.workspace-map.toml
+
 # Reopen Cursor
 ```
 
@@ -51,6 +56,11 @@ metadata wins only when its timestamp is newer; local-newer sessions are
 skipped. Equal or timestamp-less divergent sessions remain blocked instead of
 being guessed. `--conflict-strategy local` and `backup` explicitly choose one
 side for every overlap.
+
+Workspace path mappings are approval-based. `--auto-map-workspaces` is accepted
+only during dry-run and writes a TOML proposal. A real restore requires that
+reviewed file via `--workspace-map`, or explicit repeatable
+`--map-path-prefix SOURCE=TARGET` / `--map-workspace SOURCE=TARGET` options.
 
 ### Verify
 
@@ -104,6 +114,12 @@ Use `--merge` to import sessions, or `--force` to overwrite everything. Prefer `
 
 **Workspace hashes differ between machines for the same project:**
 The `--merge` mode matches workspaces by project path (from `workspace.json`), not by hash folder name. It handles same-path-different-hash cases automatically.
+
+**Usernames or workspace roots differ between machines:**
+Generate a mapping proposal with `--dry-run --auto-map-workspaces`, review the
+TOML, then pass it to the real restore with `--workspace-map`. Restore rewrites
+workspace identifiers, workspace-rooted message paths, sidebar headers, and
+transcript project slugs.
 
 **Full backup fails with "File size is greater than 2 GiB":**
 Update to the latest version. Backup now uses streaming zip (yazl) which supports files of any size via ZIP64.

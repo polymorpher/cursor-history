@@ -64,6 +64,7 @@ src/
 │   ├── storage.ts         # findWorkspaces, listSessions, getSession, extractBubbleText
 │   ├── migrate.ts         # migrateSession, migrateWorkspace, copyBubbleDataInGlobalStorage
 │   ├── backup.ts          # createBackup, restoreBackup, openBackupDatabase
+│   ├── workspace-mapping.ts # TOML mapping config, proposals, path rewriting
 │   ├── transcript.ts      # synthesizeMissingTranscripts, workspacePathToProjectSlug
 │   ├── parser.ts          # parseChatData, exportToMarkdown, exportToJson
 │   └── types.ts           # ChatSession, Message, Workspace, ToolCall, MigrationMode, etc.
@@ -296,7 +297,7 @@ try {
 | `export [index]` | Export to md/json (--all, -o, -f, --force) |
 | `migrate-session <session> <dest>` | Move/copy session(s) to workspace (--copy, --dry-run, -f, --debug) |
 | `migrate <source> <dest>` | Move/copy all sessions between workspaces (--copy, --dry-run, -f, --debug) |
-| `restore <backup>` | Preview or restore a backup (`--dry-run`, `--merge`, `--auto-resolve-conflicts`, `--conflict-strategy`, `--force`, `--no-synth`) |
+| `restore <backup>` | Preview or restore a backup (`--dry-run`, `--merge`, conflict strategies, TOML/CLI workspace mappings, `--force`, `--no-synth`) |
 | `fix-transcripts` | Synthesize missing agent transcript files from chat data so sessions are taggable/continuable (--dry-run) |
 
 ### Show Command Options
@@ -383,6 +384,9 @@ Edit `extractBubbleText()` in `src/core/storage.ts`. Priority matters:
   - Newer-session resolution updates composer metadata, sidebar headers, workspace metadata, and archived transcripts consistently while preserving existing bubble/checkpoint rows and adding missing ones
   - Manifest v1.1 records full vs filtered backup scope; filtered backups require `--merge`
   - Filtered workspace metadata and transcript copying are scoped to the selected session IDs
+  - Cross-user path changes support repeatable CLI prefix/exact mappings and approved TOML mapping files
+  - `--dry-run --auto-map-workspaces` proposes mappings and writes TOML; real restores never auto-apply proposals
+  - Approved mappings rewrite composer/header workspace identifiers, workspace-rooted bubble paths, workspace metadata, and transcript project slugs
 - Transcript synthesis: restored sessions are now taggable/continuable in Cursor
   - Cursor 3.x only lists a chat in the @-mention "past chats" menu (and resumes it with the unified agent backend) when a transcript exists at `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`; restored sessions had DB data but no transcript file
   - New `src/core/transcript.ts`: `synthesizeTranscript()` rebuilds the JSONL from bubble data (user text wrapped in `<user_query>`, assistant text + `tool_use` blocks), `synthesizeMissingTranscripts()` scans sessions listed in `composer.composerHeaders`, resolves each session's workspace (header `workspaceIdentifier` → composerData → workspace pane keys) and writes missing transcripts
